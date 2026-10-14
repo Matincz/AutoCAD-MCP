@@ -202,19 +202,20 @@ internal sealed class CadDispatcher
                 {
                     document.Database.SaveAs(fullPath, DwgVersion.Current);
                 }
-                // Database.SaveAs writes the file but leaves the open document
-                // named "DrawingN.dwg"; reopen it so name and path are the file's.
-                Document unsaved = document;
-                document = null;
-                unsaved.CloseAndDiscard();
-                document = DocumentCollectionExtension.Open(AcApplication.DocumentManager, fullPath, false);
-                AcApplication.DocumentManager.MdiActiveDocument = document;
+                // Do not close and reopen the file to fix the document name:
+                // opening a file from the plugin crashed AutoCAD 2025 in
+                // SharedRecentFilesHandlers (WSUtils.IsLoggedIn access violation).
+                if (File.Exists(fullPath))
+                {
+                    registry.RecordSavedPath(document, fullPath);
+                }
             }
             Dictionary<string, object?> context = registry.Context(document);
             context["requestedPath"] = requestedPath;
+            string? actualPath = context["activePath"] as string;
             object[] diff = string.IsNullOrWhiteSpace(fullPath)
                 ? Array.Empty<object>()
-                : fullPath.Equals(document.Database.Filename, StringComparison.OrdinalIgnoreCase)
+                : fullPath.Equals(actualPath, StringComparison.OrdinalIgnoreCase)
                     ? Array.Empty<object>()
                     : new object[]
                     {
@@ -222,7 +223,7 @@ internal sealed class CadDispatcher
                         {
                             path = "activePath",
                             requested = fullPath,
-                            actual = document.Database.Filename,
+                            actual = actualPath,
                         },
                     };
             context["diff"] = diff;

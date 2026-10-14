@@ -8,6 +8,8 @@ internal sealed class NativeDocumentState
     internal string DocId { get; } = $"acad-{Guid.NewGuid():N}";
     internal long Revision { get; set; }
     internal int SuppressEvents { get; set; }
+    // Database.SaveAs writes the file but does not rename the open document.
+    internal string? SavedPath { get; set; }
 }
 
 internal sealed class DocumentRegistry
@@ -108,9 +110,10 @@ internal sealed class DocumentRegistry
     internal Dictionary<string, object?> Context(Document document)
     {
         NativeDocumentState state = State(document);
-        string activePath = string.IsNullOrWhiteSpace(document.Database.Filename)
-            ? document.Name
-            : document.Database.Filename;
+        string activePath = state.SavedPath
+            ?? (string.IsNullOrWhiteSpace(document.Database.Filename)
+                ? document.Name
+                : document.Database.Filename);
         return new Dictionary<string, object?>
         {
             ["sessionId"] = SessionId,
@@ -124,6 +127,14 @@ internal sealed class DocumentRegistry
             ["documentName"] = document.Name,
             ["revisionSource"] = "native-database-events",
         };
+    }
+
+    internal void RecordSavedPath(Document document, string path)
+    {
+        lock (gate)
+        {
+            State(document).SavedPath = path;
+        }
     }
 
     internal void BeginMutation(Document document)
