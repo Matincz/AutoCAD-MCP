@@ -468,11 +468,9 @@ internal sealed class CadDispatcher
         double width = Positive(data, "width");
         double height = Positive(data, "height");
         var solid = new Solid3d();
+        // Solid3d.CreateBox is centered on the origin.
         solid.CreateBox(length, width, height);
-        solid.TransformBy(Matrix3d.Displacement(new Vector3d(
-            center.X - length / 2.0,
-            center.Y - width / 2.0,
-            center.Z - height / 2.0)));
+        solid.TransformBy(Matrix3d.Displacement(center.GetAsVector()));
         return solid;
     }
 
@@ -527,7 +525,8 @@ internal sealed class CadDispatcher
         }
         var solid = new Solid3d();
         solid.CreateFrustum(Math.Abs(height), radius, radius, radius);
-        double z = height > 0 ? baseCenter.Z : baseCenter.Z + height;
+        // Solid3d.CreateFrustum is centered on the origin, not standing on its base.
+        double z = (height > 0 ? baseCenter.Z : baseCenter.Z + height) + Math.Abs(height) / 2.0;
         solid.TransformBy(Matrix3d.Displacement(new Vector3d(baseCenter.X, baseCenter.Y, z)));
         return solid;
     }

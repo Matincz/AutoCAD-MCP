@@ -810,9 +810,19 @@ class FileIPCBackend(AutoCADBackend):
             "process_id": self._acad_process_id,
         }
         visibility = self._native_window_policy()
+        # Without the LISP dispatcher every non-native operation would wait for
+        # a reply that never comes, then cancel AutoCAD's command state.
+        compat = await self._load_compat_dispatcher()
+        if not compat.ok:
+            log.warning("compat_dispatcher_unavailable", error=compat.error, code=compat.error_code)
         return CommandResult(
             ok=True,
             payload={
+                "dispatcher": compat.payload if compat.ok else {
+                    "loaded": False,
+                    "error": compat.error,
+                    "error_code": compat.error_code,
+                },
                 "autocad": {
                     **self._product_info,
                     "running": True,
@@ -838,6 +848,83 @@ class FileIPCBackend(AutoCADBackend):
                 "ready": True,
                 "visibility": visibility,
             },
+        )
+
+    async def _load_compat_dispatcher(self) -> CommandResult:
+        """Locate the command line and load/version-check mcp_dispatch.lsp.
+
+        Operations the native worker does not implement (queries, text,
+        dimensions, plotting, ...) still run through this LISP dispatcher.
+        """
+        # Find command-line child edit control for focus-free dispatch
+        self._command_hwnd = self._find_command_line_hwnd()
+        log.info("command_line_hwnd", hwnd=self._command_hwnd)
+
+        # Ensure IPC directory exists
+        self._ipc_dir.mkdir(parents=True, exist_ok=True)
+
+        # Clean up stale IPC files
+        self._cleanup_stale_files()
+
+        candidates = []
+        configured = os.environ.get("AUTOCAD_MCP_LISP_PATH", "").strip()
+        if configured:
+            candidates.append(Path(configured).expanduser())
+        bundled = LISP_DIR / "mcp_dispatch.lsp"
+        if bundled not in candidates:
+            candidates.append(bundled)
+
+        last_result = None
+        loaded_path = None
+        load_attempts = 0
+        self._dispatcher_version = None
+        for candidate in candidates:
+            if not candidate.is_file():
+                continue
+            normalized_path = str(candidate.resolve()).replace("\\", "/")
+            for attempt in range(1, 4):
+                load_attempts += 1
+                self._type_command(f'(load "{normalized_path}")')
+                await asyncio.sleep(0.75 * attempt)
+                self._wait_for_autocad_idle(timeout=10.0)
+                last_result = await self._dispatch("ping", {})
+                version = (
+                    last_result.payload.get("dispatcher_version")
+                    if last_result.ok and isinstance(last_result.payload, dict)
+                    else None
+                )
+                if version == __version__:
+                    self._dispatcher_version = version
+                    loaded_path = str(candidate.resolve())
+                    break
+            if self._dispatcher_version == __version__:
+                break
+
+        if not last_result or not last_result.ok:
+            return CommandResult(
+                ok=False,
+                error="AutoCAD is running but the MCP dispatcher could not be loaded or pinged",
+                error_code="E_DISPATCHER_NOT_LOADED",
+                payload={
+                    "load_attempts": load_attempts,
+                    "last_result": last_result.to_dict() if last_result else None,
+                },
+            )
+        if self._dispatcher_version != __version__:
+            actual = (
+                last_result.payload.get("dispatcher_version")
+                if isinstance(last_result.payload, dict)
+                else "unknown"
+            )
+            return CommandResult(
+                ok=False,
+                error=f"Dispatcher version mismatch: expected {__version__}, received {actual}",
+                error_code="E_DISPATCHER_VERSION_MISMATCH",
+            )
+
+        return CommandResult(
+            ok=True,
+            payload={"loaded": True, "path": loaded_path, "load_attempts": load_attempts},
         )
 
     async def initialize(self) -> CommandResult:
@@ -988,71 +1075,11 @@ class FileIPCBackend(AutoCADBackend):
         except Exception:
             pass
 
-        # Find command-line child edit control for focus-free dispatch
-        self._command_hwnd = self._find_command_line_hwnd()
-        log.info("command_line_hwnd", hwnd=self._command_hwnd)
-
-        # Ensure IPC directory exists
-        self._ipc_dir.mkdir(parents=True, exist_ok=True)
-
-        # Clean up stale IPC files
-        self._cleanup_stale_files()
-
-        candidates = []
-        configured = os.environ.get("AUTOCAD_MCP_LISP_PATH", "").strip()
-        if configured:
-            candidates.append(Path(configured).expanduser())
-        bundled = LISP_DIR / "mcp_dispatch.lsp"
-        if bundled not in candidates:
-            candidates.append(bundled)
-
-        last_result = None
-        loaded_path = None
-        load_attempts = 0
-        self._dispatcher_version = None
-        for candidate in candidates:
-            if not candidate.is_file():
-                continue
-            normalized_path = str(candidate.resolve()).replace("\\", "/")
-            for attempt in range(1, 4):
-                load_attempts += 1
-                self._type_command(f'(load "{normalized_path}")')
-                await asyncio.sleep(0.75 * attempt)
-                self._wait_for_autocad_idle(timeout=10.0)
-                last_result = await self._dispatch("ping", {})
-                version = (
-                    last_result.payload.get("dispatcher_version")
-                    if last_result.ok and isinstance(last_result.payload, dict)
-                    else None
-                )
-                if version == __version__:
-                    self._dispatcher_version = version
-                    loaded_path = str(candidate.resolve())
-                    break
-            if self._dispatcher_version == __version__:
-                break
-
-        if not last_result or not last_result.ok:
-            return CommandResult(
-                ok=False,
-                error="AutoCAD is running but the MCP dispatcher could not be loaded or pinged",
-                error_code="E_DISPATCHER_NOT_LOADED",
-                payload={
-                    "load_attempts": load_attempts,
-                    "last_result": last_result.to_dict() if last_result else None,
-                },
-            )
-        if self._dispatcher_version != __version__:
-            actual = (
-                last_result.payload.get("dispatcher_version")
-                if isinstance(last_result.payload, dict)
-                else "unknown"
-            )
-            return CommandResult(
-                ok=False,
-                error=f"Dispatcher version mismatch: expected {__version__}, received {actual}",
-                error_code="E_DISPATCHER_VERSION_MISMATCH",
-            )
+        dispatcher = await self._load_compat_dispatcher()
+        if not dispatcher.ok:
+            return dispatcher
+        loaded_path = dispatcher.payload["path"]
+        load_attempts = dispatcher.payload["load_attempts"]
 
         self._session.transport_state = TransportState.COM_READY
         self._session.document_state = DocumentState.READY
