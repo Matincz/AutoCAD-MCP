@@ -75,6 +75,40 @@ def window_discovery_status() -> dict:
     }
 
 
+def _ansi_codepage() -> str:
+    """The code page AutoLISP uses for open/read-line/write-line (e.g. cp936)."""
+    if sys.platform == "win32":
+        try:
+            import ctypes
+
+            return f"cp{ctypes.windll.kernel32.GetACP()}"
+        except Exception:
+            pass
+    return "cp1252"
+
+
+def _encode_ipc_request(payload: dict, codepage: str | None = None) -> bytes:
+    """Encode a request so AutoLISP's read-line sees the real characters.
+
+    Text the ANSI code page can represent (e.g. Chinese on cp936) is written
+    as-is; otherwise fall back to ASCII \\uXXXX escapes, which the dispatcher
+    decodes as well.
+    """
+    codepage = codepage or _ansi_codepage()
+    try:
+        return json.dumps(payload, ensure_ascii=False).encode(codepage)
+    except UnicodeEncodeError:
+        return json.dumps(payload).encode("ascii")
+
+
+def _decode_ipc_result(raw: bytes, codepage: str | None = None) -> str:
+    """AutoLISP writes result files in the ANSI code page, not UTF-8."""
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return raw.decode(codepage or _ansi_codepage(), errors="replace")
+
+
 def _dispatcher_load_expression(path: str) -> str:
     """LISP that loads the dispatcher into every open and future document.
 
@@ -1849,7 +1883,7 @@ class FileIPCBackend(AutoCADBackend):
                 "params": clean_params,
                 "ts": time.time(),
             }
-            tmp_file.write_text(json.dumps(payload), encoding="utf-8")
+            tmp_file.write_bytes(_encode_ipc_request(payload))
             tmp_file.rename(cmd_file)
 
             # Type the fixed dispatch trigger only after AutoCAD reaches idle.
@@ -1871,12 +1905,7 @@ class FileIPCBackend(AutoCADBackend):
                     return self._autocad_crashed_result(crash, command)
                 if result_file.exists():
                     try:
-                        # AutoCAD LISP writes files in Windows-1252 encoding;
-                        # try UTF-8 first (covers ASCII), fall back to cp1252
-                        try:
-                            text = result_file.read_text(encoding="utf-8")
-                        except UnicodeDecodeError:
-                            text = result_file.read_text(encoding="cp1252")
+                        text = _decode_ipc_result(result_file.read_bytes())
                         data = json.loads(text)
                         # Verify request_id matches
                         if data.get("request_id") == request_id:

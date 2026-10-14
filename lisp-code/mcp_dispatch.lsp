@@ -90,6 +90,17 @@
 ;; Simple JSON parser (extracts string values by key)
 ;; -----------------------------------------------------------------------
 
+(defun mcp-hex4 (h / n i c)
+  "Parse four hex digits (from a JSON \\uXXXX escape) into an integer."
+  (setq n 0 i 1)
+  (while (<= i 4)
+    (setq c (ascii (strcase (substr h i 1))))
+    (setq n (+ (* n 16) (if (<= c 57) (- c 48) (- c 55))))
+    (setq i (1+ i))
+  )
+  n
+)
+
 (defun mcp-json-unescape-string (s / result i ch next)
   "Decode the JSON escapes used by the Python IPC writer."
   (setq result "" i 1)
@@ -105,6 +116,9 @@
           ((= next "n") (setq result (strcat result (chr 10))))
           ((= next "r") (setq result (strcat result (chr 13))))
           ((= next "t") (setq result (strcat result (chr 9))))
+          ((and (= next "u") (<= (+ i 5) (strlen s)))
+            (setq result (strcat result (chr (mcp-hex4 (substr s (+ i 2) 4)))))
+            (setq i (+ i 4)))
           (t (setq result (strcat result "\\" next)))
         )
         (setq i (+ i 2))

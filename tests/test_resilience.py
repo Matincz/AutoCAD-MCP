@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import json
 import sys
 import types
 from pathlib import Path
@@ -694,3 +695,22 @@ def test_dispatcher_loads_into_all_documents():
     assert expression == (
         '(if vl-load-all (vl-load-all "C:/x/mcp_dispatch.lsp") (load "C:/x/mcp_dispatch.lsp"))'
     )
+
+
+def test_ipc_result_decodes_ansi_codepage_chinese():
+    import autocad_mcp.backends.file_ipc as file_ipc
+
+    raw = '{"layers": ["P-洁具", "图层0"]}'.encode("cp936")
+
+    assert json.loads(file_ipc._decode_ipc_result(raw, "cp936")) == {"layers": ["P-洁具", "图层0"]}
+    assert file_ipc._decode_ipc_result('{"a": "客厅"}'.encode("utf-8"), "cp936") == '{"a": "客厅"}'
+
+
+def test_ipc_request_keeps_chinese_in_ansi_and_escapes_the_rest():
+    import autocad_mcp.backends.file_ipc as file_ipc
+
+    encoded = file_ipc._encode_ipc_request({"text": "客厅"}, "cp936")
+    assert encoded.decode("cp936") == '{"text": "客厅"}'
+
+    fallback = file_ipc._encode_ipc_request({"text": "客厅 😀"}, "cp936")
+    assert fallback == b'{"text": "\\u5ba2\\u5385 \\ud83d\\ude00"}'
