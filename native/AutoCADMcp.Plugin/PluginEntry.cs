@@ -13,6 +13,7 @@ public sealed class PluginEntry : IExtensionApplication
 
     public void Initialize()
     {
+        SharedRecentFilesGuard.Install();
         try
         {
             var registry = new DocumentRegistry();

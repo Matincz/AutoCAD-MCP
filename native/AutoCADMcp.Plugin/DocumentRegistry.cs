@@ -1,4 +1,5 @@
 using Autodesk.AutoCAD.ApplicationServices;
+using Autodesk.AutoCAD.DatabaseServices;
 using AcApplication = Autodesk.AutoCAD.ApplicationServices.Core.Application;
 
 namespace AutoCADMcp.Plugin;
@@ -10,6 +11,11 @@ internal sealed class NativeDocumentState
     internal int SuppressEvents { get; set; }
     // Database.SaveAs writes the file but does not rename the open document.
     internal string? SavedPath { get; set; }
+    // Kept so the handlers can be detached before the document is destroyed.
+    internal Database? Database { get; set; }
+    internal ObjectEventHandler? OnAppended { get; set; }
+    internal ObjectEventHandler? OnModified { get; set; }
+    internal ObjectErasedEventHandler? OnErased { get; set; }
 }
 
 internal sealed class DocumentRegistry
@@ -21,8 +27,8 @@ internal sealed class DocumentRegistry
 
     internal DocumentRegistry()
     {
-        AcApplication.DocumentManager.DocumentCreated += (_, args) => Register(args.Document);
-        AcApplication.DocumentManager.DocumentToBeDestroyed += (_, args) => Unregister(args.Document);
+        AcApplication.DocumentManager.DocumentCreated += (_, args) => Guard(() => Register(args.Document));
+        AcApplication.DocumentManager.DocumentToBeDestroyed += (_, args) => Guard(() => Unregister(args.Document));
         foreach (Document document in AcApplication.DocumentManager)
         {
             Register(document);
@@ -39,9 +45,14 @@ internal sealed class DocumentRegistry
             }
             var state = new NativeDocumentState();
             documents[document] = state;
-            document.Database.ObjectAppended += (_, _) => Touch(document);
-            document.Database.ObjectModified += (_, _) => Touch(document);
-            document.Database.ObjectErased += (_, _) => Touch(document);
+            Database database = document.Database;
+            state.Database = database;
+            state.OnAppended = (_, _) => Touch(state);
+            state.OnModified = (_, _) => Touch(state);
+            state.OnErased = (_, _) => Touch(state);
+            database.ObjectAppended += state.OnAppended;
+            database.ObjectModified += state.OnModified;
+            database.ObjectErased += state.OnErased;
             return state;
         }
     }
@@ -68,12 +79,46 @@ internal sealed class DocumentRegistry
 
     internal NativeDocumentState State(Document document) => Register(document);
 
+    private static void Guard(Action action)
+    {
+        try
+        {
+            action();
+        }
+        catch (System.Exception error)
+        {
+            System.Diagnostics.Trace.WriteLine($"AutoCAD-MCP: document event handler failed: {error}");
+        }
+    }
+
+    // Called from DocumentToBeDestroyed.  The database keeps raising object
+    // events while the document is torn down; a handler that still referenced
+    // the document re-registered it and dereferenced the disposed wrapper,
+    // crashing AutoCAD with a null-pointer access violation.
     private void Unregister(Document document)
     {
+        NativeDocumentState? state;
         lock (gate)
         {
-            documents.Remove(document);
+            if (!documents.Remove(document, out state))
+            {
+                return;
+            }
         }
+        try
+        {
+            if (state.Database is { IsDisposed: false } database)
+            {
+                database.ObjectAppended -= state.OnAppended;
+                database.ObjectModified -= state.OnModified;
+                database.ObjectErased -= state.OnErased;
+            }
+        }
+        catch (System.Exception error)
+        {
+            System.Diagnostics.Trace.WriteLine($"AutoCAD-MCP: detaching document events failed: {error}");
+        }
+        state.Database = null;
     }
 
     internal void Validate(Document document, RpcRequest request)
@@ -158,15 +203,23 @@ internal sealed class DocumentRegistry
         }
     }
 
-    private void Touch(Document document)
+    // Runs inside AutoCAD's database reactors: never touch the Document or
+    // Database here and never let an exception escape into AutoCAD.
+    private void Touch(NativeDocumentState state)
     {
-        lock (gate)
+        try
         {
-            NativeDocumentState state = State(document);
-            if (state.SuppressEvents == 0)
+            lock (gate)
             {
-                state.Revision += 1;
+                if (state.Database is not null && state.SuppressEvents == 0)
+                {
+                    state.Revision += 1;
+                }
             }
+        }
+        catch (System.Exception error)
+        {
+            System.Diagnostics.Trace.WriteLine($"AutoCAD-MCP: revision update failed: {error}");
         }
     }
 }
