@@ -1851,10 +1851,18 @@ async def transaction(
         )
         if replay is not None:
             return await add_screenshot_if_available(replay, False)
-        result = await backend.drawing_create(
-            data.get("path") or data.get("name"),
-            idempotency_key=idempotency_key,
-        )
+        requested_name = data.get("path") or data.get("name")
+        target_path = None
+        if requested_name:
+            target_path = str(
+                resolve_output_target(
+                    data.get("path"),
+                    category="drawings",
+                    extension=".dwg",
+                    default_stem=str(data.get("name") or "drawing"),
+                ).path
+            )
+        result = await backend.drawing_create(target_path, idempotency_key=idempotency_key)
         result = _finish_journaled_mutation(idempotency_key, result)
     elif operation == "execute":
         if not doc_id or expected_revision is None or not idempotency_key:

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from autocad_mcp import server
@@ -50,3 +52,30 @@ def test_wildcard_bind_requires_explicit_allowed_hosts(monkeypatch):
     assert "0.0.0.0:*" not in allowed
     assert "10.211.55.4:8765" in allowed
     assert "win-vm.local:8765" in allowed
+
+
+async def test_transaction_create_resolves_name_into_output_workspace(monkeypatch, tmp_path):
+    from autocad_mcp.backends.base import CommandResult
+
+    monkeypatch.setenv("AUTOCAD_MCP_OUTPUT_ROOT", str(tmp_path))
+    requested = []
+
+    class FakeBackend:
+        name = "file_ipc"
+
+        async def drawing_create(self, name, idempotency_key=None):
+            requested.append(name)
+            return CommandResult(ok=True, payload={})
+
+    async def fake_backend():
+        return FakeBackend()
+
+    monkeypatch.setattr(server, "get_backend", fake_backend)
+    monkeypatch.setattr(server, "_begin_journaled_mutation", lambda *args, **kwargs: None)
+    monkeypatch.setattr(server, "_finish_journaled_mutation", lambda key, result: result)
+
+    await server.transaction(operation="create", idempotency_key="k1", data={"name": "native-smoke"})
+
+    created = Path(requested[0])
+    assert created.parent == (tmp_path / "drawings").resolve()
+    assert created.name.startswith("native-smoke-") and created.suffix == ".dwg"

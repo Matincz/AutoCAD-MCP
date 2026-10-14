@@ -198,8 +198,17 @@ internal sealed class CadDispatcher
             {
                 fullPath = Path.GetFullPath(requestedPath);
                 Directory.CreateDirectory(Path.GetDirectoryName(fullPath)!);
-                using DocumentLock documentLock = document.LockDocument();
-                document.Database.SaveAs(fullPath, DwgVersion.Current);
+                using (document.LockDocument())
+                {
+                    document.Database.SaveAs(fullPath, DwgVersion.Current);
+                }
+                // Database.SaveAs writes the file but leaves the open document
+                // named "DrawingN.dwg"; reopen it so name and path are the file's.
+                Document unsaved = document;
+                document = null;
+                unsaved.CloseAndDiscard();
+                document = DocumentCollectionExtension.Open(AcApplication.DocumentManager, fullPath, false);
+                AcApplication.DocumentManager.MdiActiveDocument = document;
             }
             Dictionary<string, object?> context = registry.Context(document);
             context["requestedPath"] = requestedPath;
@@ -549,11 +558,13 @@ internal sealed class CadDispatcher
 
         static double[] Point(JsonElement value)
         {
-            if (value.ValueKind != JsonValueKind.Array || value.GetArrayLength() < 3)
+            // Creation accepts [x, y] with z = 0; readback must compare the same way.
+            if (value.ValueKind != JsonValueKind.Array || value.GetArrayLength() is < 2 or > 3)
             {
                 throw new CadProtocolException("E_POSTCONDITION_MISMATCH", "A point readback request is malformed");
             }
-            return value.EnumerateArray().Take(3).Select(item => item.GetDouble()).ToArray();
+            double[] coordinates = value.EnumerateArray().Select(item => item.GetDouble()).ToArray();
+            return coordinates.Length == 3 ? coordinates : new[] { coordinates[0], coordinates[1], 0.0 };
         }
 
         void Compare(string path, double expected, double actual)
