@@ -75,6 +75,16 @@ def window_discovery_status() -> dict:
     }
 
 
+def _dispatcher_load_expression(path: str) -> str:
+    """LISP that loads the dispatcher into every open and future document.
+
+    Plain ``load`` only affects the active document, so a drawing created or
+    activated later (e.g. by the native worker) had no dispatcher and every
+    LISP-path request timed out there.
+    """
+    return f'(if vl-load-all (vl-load-all "{path}") (load "{path}"))'
+
+
 def find_autocad_window(preferred_process_id: int | None = None) -> int | None:
     """Find the AutoCAD main window, including hidden automation sessions."""
     if sys.platform != "win32":
@@ -884,7 +894,7 @@ class FileIPCBackend(AutoCADBackend):
             normalized_path = str(candidate.resolve()).replace("\\", "/")
             for attempt in range(1, 4):
                 load_attempts += 1
-                self._type_command(f'(load "{normalized_path}")')
+                self._type_command(_dispatcher_load_expression(normalized_path))
                 await asyncio.sleep(0.75 * attempt)
                 self._wait_for_autocad_idle(timeout=10.0)
                 last_result = await self._dispatch("ping", {})
@@ -2507,7 +2517,9 @@ class FileIPCBackend(AutoCADBackend):
                     raise RuntimeError(f"AutoCAD created {actual_path} instead of {expected}")
 
             dispatcher = Path(os.environ.get("AUTOCAD_MCP_LISP_PATH", "") or (LISP_DIR / "mcp_dispatch.lsp"))
-            self._type_command(f'(load "{str(dispatcher.resolve()).replace(chr(92), "/")}")')
+            self._type_command(
+                _dispatcher_load_expression(str(dispatcher.resolve()).replace(chr(92), "/"))
+            )
             self._wait_for_autocad_idle(timeout=10.0)
             self._audit_revision = 0
             self._audit_fingerprints = None

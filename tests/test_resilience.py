@@ -684,3 +684,13 @@ def test_window_discovery_picks_main_frame_when_one_process_owns_several_windows
     assert file_ipc.find_autocad_window() == 460234
     assert file_ipc._LAST_WINDOW_DISCOVERY["selection"] == "single-process-main-frame"
     assert file_ipc.find_autocad_window(preferred_process_id=6252) == 460234
+
+
+def test_dispatcher_loads_into_all_documents():
+    import autocad_mcp.backends.file_ipc as file_ipc
+
+    expression = file_ipc._dispatcher_load_expression("C:/x/mcp_dispatch.lsp")
+
+    assert expression == (
+        '(if vl-load-all (vl-load-all "C:/x/mcp_dispatch.lsp") (load "C:/x/mcp_dispatch.lsp"))'
+    )
