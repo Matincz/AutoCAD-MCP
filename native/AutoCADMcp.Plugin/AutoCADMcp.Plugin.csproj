@@ -11,6 +11,11 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <!-- UseWPF drops System.IO from the implicit usings. -->
+    <Using Include="System.IO" />
+  </ItemGroup>
+
+  <ItemGroup>
     <Reference Include="AcCoreMgd">
       <HintPath>$(AutoCADDir)\AcCoreMgd.dll</HintPath>
       <Private>false</Private>
