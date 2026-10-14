@@ -32,13 +32,32 @@ $packagedAssembly = Join-Path $contentRoot "AutoCADMcp.Plugin.dll"
 Copy-Item -LiteralPath $assembly -Destination $packagedAssembly -Force
 
 if ($CertificateThumbprint) {
-    & $SignTool sign /sha1 $CertificateThumbprint /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 $packagedAssembly
-    if ($LASTEXITCODE -ne 0) {
-        throw "Authenticode signing failed with exit code $LASTEXITCODE."
-    }
-    & $SignTool verify /pa $packagedAssembly
-    if ($LASTEXITCODE -ne 0) {
-        throw "The packaged native plugin did not pass Authenticode verification."
+    if (Get-Command $SignTool -ErrorAction SilentlyContinue) {
+        & $SignTool sign /sha1 $CertificateThumbprint /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 $packagedAssembly
+        if ($LASTEXITCODE -ne 0) {
+            throw "Authenticode signing failed with exit code $LASTEXITCODE."
+        }
+        & $SignTool verify /pa $packagedAssembly
+        if ($LASTEXITCODE -ne 0) {
+            throw "The packaged native plugin did not pass Authenticode verification."
+        }
+    } else {
+        # signtool ships with the Windows SDK; PowerShell's Authenticode cmdlets
+        # produce the same SHA-256 timestamped signature without it.
+        $certificate = Get-ChildItem -Path Cert:\CurrentUser\My, Cert:\LocalMachine\My |
+            Where-Object Thumbprint -eq $CertificateThumbprint | Select-Object -First 1
+        if (-not $certificate) {
+            throw "Code-signing certificate $CertificateThumbprint was not found in CurrentUser\My or LocalMachine\My."
+        }
+        $signature = Set-AuthenticodeSignature -FilePath $packagedAssembly -Certificate $certificate `
+            -HashAlgorithm SHA256 -TimestampServer http://timestamp.digicert.com
+        if ($signature.Status -ne "Valid") {
+            throw "Authenticode signing failed: $($signature.Status) $($signature.StatusMessage)"
+        }
+        $verified = Get-AuthenticodeSignature -FilePath $packagedAssembly
+        if ($verified.Status -ne "Valid") {
+            throw "The packaged native plugin did not pass Authenticode verification: $($verified.StatusMessage)"
+        }
     }
 }
 
