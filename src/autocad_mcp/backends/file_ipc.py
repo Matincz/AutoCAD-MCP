@@ -133,12 +133,17 @@ def find_autocad_window(preferred_process_id: int | None = None) -> int | None:
 
                 if is_autocad:
                     title = str(win32gui.GetWindowText(hwnd) or "")
+                    try:
+                        owned = bool(win32gui.GetWindow(hwnd, win32con.GW_OWNER))
+                    except Exception:
+                        owned = False
                     item = {
                         "hwnd": int(hwnd),
                         "process_id": int(process_id) if process_id is not None else None,
                         "visible": True,
                         "minimized": bool(win32gui.IsIconic(hwnd)),
                         "title": title,
+                        "owned": owned,
                     }
                     if any(token in title.casefold() for token in fatal_tokens):
                         fatal_windows.append(item)
@@ -150,13 +155,13 @@ def find_autocad_window(preferred_process_id: int | None = None) -> int | None:
         _LAST_WINDOW_DISCOVERY["candidates"] = windows
         _LAST_WINDOW_DISCOVERY["fatal_windows"] = fatal_windows
         if preferred_process_id is not None:
+            matching = [
+                item for item in windows if item["process_id"] == int(preferred_process_id)
+            ]
+            # Owned windows (palettes, WPF hosts, error dialogs) share the
+            # process; the unowned frame is the application window.
             preferred = next(
-                (
-                    item
-                    for item in windows
-                    if item["process_id"] == int(preferred_process_id)
-                ),
-                None,
+                iter([item for item in matching if not item["owned"]] or matching), None
             )
             if preferred:
                 _LAST_WINDOW_DISCOVERY["selection"] = "preferred-process"
@@ -164,6 +169,11 @@ def find_autocad_window(preferred_process_id: int | None = None) -> int | None:
         if len(windows) == 1 and preferred_process_id is None:
             _LAST_WINDOW_DISCOVERY["selection"] = "single-visible-window"
             return windows[0]["hwnd"]
+        if preferred_process_id is None and len({item["process_id"] for item in windows}) == 1:
+            frames = [item for item in windows if not item["owned"]]
+            if len(frames) == 1:
+                _LAST_WINDOW_DISCOVERY["selection"] = "single-process-main-frame"
+                return frames[0]["hwnd"]
 
         executor = ComStaExecutor(name="autocad-mcp-window-discovery")
         try:

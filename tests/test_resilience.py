@@ -643,3 +643,44 @@ def test_output_viewer_guard_targets_only_the_generated_pdf(monkeypatch, tmp_pat
     assert [item[0] for item in calls["hidden"]] == [20]
     assert [item[0] for item in calls["closed"]] == [20]
     assert all(event["title"].startswith(target.name) for event in result["events"])
+
+
+def test_window_discovery_picks_main_frame_when_one_process_owns_several_windows(monkeypatch):
+    import autocad_mcp.backends.file_ipc as file_ipc
+
+    # One acad.exe: the MDI frame plus an owned WPF host and an owned dialog.
+    owners = {460234: 0, 4063896: 460234, 525644: 460234}
+    titles = {460234: "Autodesk AutoCAD 2025 - [plan.dwg]", 4063896: "", 525644: "AutoCAD"}
+
+    def enum_windows(callback, state):
+        for hwnd in owners:
+            callback(hwnd, state)
+
+    win32gui = types.SimpleNamespace(
+        EnumWindows=enum_windows,
+        IsWindowVisible=lambda hwnd: True,
+        IsIconic=lambda hwnd: False,
+        GetWindowText=lambda hwnd: titles[hwnd],
+        GetWindow=lambda hwnd, relation: owners[hwnd],
+    )
+    win32con = types.SimpleNamespace(
+        GW_OWNER=4, PROCESS_QUERY_INFORMATION=0x400, PROCESS_VM_READ=0x10
+    )
+    win32process = types.SimpleNamespace(
+        GetWindowThreadProcessId=lambda hwnd: (1, 6252),
+        GetModuleFileNameEx=lambda handle, module: "C:/Program Files/Autodesk/AutoCAD 2025/acad.exe",
+    )
+    win32api = types.SimpleNamespace(OpenProcess=lambda *args: object(), CloseHandle=lambda handle: None)
+    monkeypatch.setattr(file_ipc.sys, "platform", "win32")
+    monkeypatch.delenv("AUTOCAD_MCP_ACAD_PID", raising=False)
+    for name, module in {
+        "win32gui": win32gui,
+        "win32con": win32con,
+        "win32process": win32process,
+        "win32api": win32api,
+    }.items():
+        monkeypatch.setitem(sys.modules, name, module)
+
+    assert file_ipc.find_autocad_window() == 460234
+    assert file_ipc._LAST_WINDOW_DISCOVERY["selection"] == "single-process-main-frame"
+    assert file_ipc.find_autocad_window(preferred_process_id=6252) == 460234

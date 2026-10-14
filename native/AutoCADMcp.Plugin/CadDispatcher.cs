@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using System.Windows.Threading;
 using Autodesk.AutoCAD.ApplicationServices;
 using Autodesk.AutoCAD.DatabaseServices;
 using Autodesk.AutoCAD.Geometry;
@@ -15,10 +16,13 @@ internal sealed class CadDispatcher
     private readonly DocumentRegistry registry;
     private readonly string? requiredToken;
     private readonly ConcurrentDictionary<string, (string Hash, RpcResponse Response)> completed = new();
+    private readonly Dispatcher autocadThread;
 
+    // Must be constructed on AutoCAD's main thread (IExtensionApplication.Initialize).
     internal CadDispatcher(DocumentRegistry registry)
     {
         this.registry = registry;
+        autocadThread = Dispatcher.CurrentDispatcher;
         requiredToken = Environment.GetEnvironmentVariable("AUTOCAD_MCP_PLUGIN_TOKEN");
     }
 
@@ -50,45 +54,7 @@ internal sealed class CadDispatcher
         }
 
         var completion = new TaskCompletionSource<RpcResponse>(TaskCreationOptions.RunContinuationsAsynchronously);
-        try
-        {
-            AcApplication.DocumentManager.ExecuteInApplicationContext(_ =>
-            {
-                RpcResponse response;
-                try
-                {
-                    response = DispatchOnAutoCADThread(request);
-                }
-                catch (CadProtocolException error)
-                {
-                    response = RpcResponse.Failure(
-                        request.Id,
-                        error.Code,
-                        error.Message,
-                        error.Recoverable,
-                        error.RecommendedAction,
-                        error.Details);
-                }
-                catch (Exception error)
-                {
-                    response = RpcResponse.Failure(
-                        request.Id,
-                        "E_NATIVE_PLUGIN_FAILURE",
-                        error.Message,
-                        details: new { exceptionType = error.GetType().FullName });
-                }
-
-                // A failed mutation was never committed, so it must remain retryable.
-                // Only successful responses are safe to replay indefinitely.
-                if (request.IdempotencyKey is not null && response.Ok)
-                {
-                    completed.TryAdd(request.IdempotencyKey, (requestHash, response));
-                }
-                completion.TrySetResult(response);
-            }, null);
-        }
-        catch (Exception error)
-        {
+        void RejectScheduling(Exception error) =>
             // ExecuteInApplicationContext can reject work synchronously while
             // AutoCAD is closing or inside a modal command.  Complete the RPC
             // immediately; otherwise the pipe client only sees a timeout and
@@ -100,6 +66,63 @@ internal sealed class CadDispatcher
                 recoverable: true,
                 recommendedAction: "wait_for_autocad_to_return_to_idle_then_retry",
                 details: new { exceptionType = error.GetType().FullName, error = error.Message }));
+
+        // The pipe listener runs on a thread-pool thread.  DocumentManager APIs,
+        // including ExecuteInApplicationContext, must be entered from AutoCAD's
+        // main thread; calling them here raised Application.Idle off-thread and
+        // crashed the WPF ribbon with "calling thread cannot access this object".
+        void Schedule()
+        {
+            try
+            {
+                AcApplication.DocumentManager.ExecuteInApplicationContext(_ =>
+                {
+                    RpcResponse response;
+                    try
+                    {
+                        response = DispatchOnAutoCADThread(request);
+                    }
+                    catch (CadProtocolException error)
+                    {
+                        response = RpcResponse.Failure(
+                            request.Id,
+                            error.Code,
+                            error.Message,
+                            error.Recoverable,
+                            error.RecommendedAction,
+                            error.Details);
+                    }
+                    catch (Exception error)
+                    {
+                        response = RpcResponse.Failure(
+                            request.Id,
+                            "E_NATIVE_PLUGIN_FAILURE",
+                            error.Message,
+                            details: new { exceptionType = error.GetType().FullName });
+                    }
+
+                    // A failed mutation was never committed, so it must remain retryable.
+                    // Only successful responses are safe to replay indefinitely.
+                    if (request.IdempotencyKey is not null && response.Ok)
+                    {
+                        completed.TryAdd(request.IdempotencyKey, (requestHash, response));
+                    }
+                    completion.TrySetResult(response);
+                }, null);
+            }
+            catch (Exception error)
+            {
+                RejectScheduling(error);
+            }
+        }
+
+        try
+        {
+            autocadThread.BeginInvoke(new Action(Schedule));
+        }
+        catch (Exception error)
+        {
+            RejectScheduling(error);
         }
         return completion.Task;
     }
