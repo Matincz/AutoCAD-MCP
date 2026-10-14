@@ -10,6 +10,7 @@ from unittest.mock import MagicMock
 
 import ezdxf
 import fitz
+import pytest
 from PIL import Image
 
 from autocad_mcp.backends.base import CommandResult
@@ -20,6 +21,7 @@ from autocad_mcp.logging_setup import UTF8_BOM, TeeLogWriter
 from autocad_mcp.offline import audit_dxf_offline
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows-only AutoCAD runtime behavior")
 async def test_ensure_ready_reports_broken_pywin32_before_com_or_document_access(monkeypatch):
     import autocad_mcp.backends.file_ipc as file_ipc
 

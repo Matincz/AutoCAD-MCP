@@ -2192,8 +2192,63 @@ async def system(
 # ==========================================================================
 
 
+_LOCAL_HTTP_HOSTS = ("127.0.0.1", "localhost", "::1")
+
+
+def _http_host_pattern(host: str) -> str:
+    return f"[{host}]:*" if ":" in host else f"{host}:*"
+
+
+def configure_server_transport(argv: list[str] | None = None) -> str:
+    """Resolve the MCP transport from CLI flags and environment variables.
+
+    stdio stays the default. ``streamable-http`` lets a client on another
+    machine (for example macOS driving AutoCAD in a Windows VM) reach the
+    server; DNS-rebinding protection remains on and only the bind host,
+    localhost, and ``AUTOCAD_MCP_HTTP_ALLOWED_HOSTS`` entries are accepted.
+    """
+    import argparse
+    import os
+
+    from mcp.server.transport_security import TransportSecuritySettings
+
+    parser = argparse.ArgumentParser(prog="autocad-mcp")
+    parser.add_argument(
+        "--transport",
+        choices=["stdio", "streamable-http"],
+        default=os.environ.get("AUTOCAD_MCP_SERVER_TRANSPORT", "stdio"),
+    )
+    parser.add_argument("--host", default=os.environ.get("AUTOCAD_MCP_HTTP_HOST", "127.0.0.1"))
+    parser.add_argument("--port", type=int, default=int(os.environ.get("AUTOCAD_MCP_HTTP_PORT", "8765")))
+    parser.add_argument(
+        "--allowed-hosts",
+        default=os.environ.get("AUTOCAD_MCP_HTTP_ALLOWED_HOSTS", ""),
+        help="Comma-separated extra Host header values, e.g. 10.211.55.4:8765",
+    )
+    args = parser.parse_args(argv)
+
+    if args.transport == "stdio":
+        return "stdio"
+
+    allowed_hosts = [_http_host_pattern(h) for h in _LOCAL_HTTP_HOSTS]
+    if args.host not in _LOCAL_HTTP_HOSTS and args.host not in ("0.0.0.0", "::"):
+        allowed_hosts.append(_http_host_pattern(args.host))
+    allowed_hosts.extend(h.strip() for h in args.allowed_hosts.split(",") if h.strip())
+
+    mcp.settings.host = args.host
+    mcp.settings.port = args.port
+    mcp.settings.transport_security = TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=allowed_hosts,
+        allowed_origins=[f"http://{h}" for h in allowed_hosts],
+    )
+    return args.transport
+
+
 def main():
-    """Run the MCP server on stdio transport."""
+    """Run the MCP server (stdio by default, optionally streamable HTTP)."""
+    transport = configure_server_transport()
+
     # Load NumPy-backed ezdxf modules before AnyIO starts worker threads.
     # Late native-module imports can stall on some Windows Python runtimes.
     import ezdxf  # noqa: F401
@@ -2204,5 +2259,12 @@ def main():
 
     from autocad_mcp import __version__
 
-    log.info("autocad_mcp_starting", version=__version__, log_path=str(log_path))
-    mcp.run(transport="stdio")
+    log.info(
+        "autocad_mcp_starting",
+        version=__version__,
+        log_path=str(log_path),
+        transport=transport,
+        host=mcp.settings.host if transport != "stdio" else None,
+        port=mcp.settings.port if transport != "stdio" else None,
+    )
+    mcp.run(transport=transport)

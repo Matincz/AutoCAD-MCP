@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import sys
+
+import pytest
+
 from autocad_mcp.runtime_health import (
     activity_insights_write_preflight,
     autocad_cer_snapshot,
@@ -85,6 +89,7 @@ def test_cer_snapshot_extracts_t1_crash_fields(monkeypatch, tmp_path):
     assert record["crash_date"] == "07/18/2026"
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows-only AutoCAD runtime behavior")
 def test_cer_log_is_used_when_rawdata_is_not_enumerable(monkeypatch, tmp_path):
     log = tmp_path / "cer.log"
     log.write_text(

@@ -80,3 +80,6 @@ PIDv4-CTO/
 /docs/TOOLS-INVENTORY-UPDATE-*.md
 /docs/tool-installation-record-*.md
 /scripts/restore_autocad_user_profile.ps1
+
+# Headless demo output
+demo-output/
