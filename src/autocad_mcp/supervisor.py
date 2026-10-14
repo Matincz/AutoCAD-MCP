@@ -20,7 +20,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-from autocad_mcp.native_pipe import NativePipeError, discover_native_worker
+from autocad_mcp.native_pipe import NativePipeError, _process_is_alive, discover_native_worker
 from autocad_mcp.config import build_autocad_startup_command
 
 
@@ -58,15 +58,9 @@ def _append_utf8_bom_log(path: Path, event: str, **data: Any) -> None:
 
 
 def _process_alive(process_id: int | None) -> bool:
-    if not process_id or process_id <= 0:
+    if not process_id:
         return False
-    try:
-        os.kill(process_id, 0)
-        return True
-    except PermissionError:
-        return True
-    except OSError:
-        return False
+    return _process_is_alive(int(process_id))
 
 
 def _windows_for_process(process_id: int) -> list[dict[str, Any]]:
