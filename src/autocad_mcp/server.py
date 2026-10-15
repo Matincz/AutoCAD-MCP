@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import copy
 import math
+import time
 from typing import Any
 
 import structlog
@@ -831,6 +832,48 @@ async def drawing(
 # ==========================================================================
 
 
+GET_MANY_LIMIT = 200
+# Per-handle failures that say nothing about the CAD session itself.
+_ENTITY_LEVEL_ERRORS = {None, "E_ENTITY_NOT_FOUND", "E_PARAMETER_REJECTED", "E_INVALID_HANDLE"}
+
+
+async def _entity_get_many(backend, entity_ids) -> CommandResult:
+    """Serial directed reads in one request, so callers stay within transport budgets."""
+    if (
+        not isinstance(entity_ids, list)
+        or not 1 <= len(entity_ids) <= GET_MANY_LIMIT
+        or not all(isinstance(h, str) and h.strip() for h in entity_ids)
+    ):
+        return CommandResult(
+            ok=False,
+            error=f"data.entity_ids must be 1..{GET_MANY_LIMIT} non-empty handle strings",
+            error_code="E_PARAMETER_REJECTED",
+        )
+    entities, errors = {}, {}
+    started = time.monotonic()
+    for handle in dict.fromkeys(h.strip() for h in entity_ids):
+        result = await backend.entity_get_with_semantics(handle)
+        if result.ok:
+            entities[handle] = result.payload
+            continue
+        errors[handle] = {"code": result.error_code, "error": result.error}
+        if result.error_code not in _ENTITY_LEVEL_ERRORS:
+            return CommandResult(
+                ok=False,
+                error=f"get_many stopped at {handle}: {result.error}",
+                error_code=result.error_code,
+                payload={"entities": entities, "errors": errors, "stopped_at": handle},
+            )
+    return CommandResult(
+        ok=True,
+        payload={
+            "entities": entities,
+            "errors": errors,
+            "elapsed_seconds": round(time.monotonic() - started, 3),
+        },
+    )
+
+
 @mcp.tool(annotations={"title": "AutoCAD Entity Operations", "readOnlyHint": False})
 @_safe("entity")
 async def entity(
@@ -868,6 +911,9 @@ async def entity(
       list              — layer? → list entities
       count             — layer? → count entities
       get               — entity_id → entity details
+      get_many          — data: {entity_ids: [1..200 handles]} → {entities, errors};
+                          serial reads in one request; stops at the first
+                          non-entity failure (crash/timeout/transport)
 
     Modify operations:
       copy    — entity_id, data: {dx, dy}
@@ -887,12 +933,12 @@ async def entity(
         "create_line", "create_circle", "create_polyline", "create_rectangle",
         "create_arc", "create_tangent_arc", "create_ellipse", "create_mtext",
         "create_text", "create_hatch", "create_batch", "list", "count", "get",
-        "copy", "move", "rotate", "scale", "mirror", "offset", "array", "fillet",
+        "get_many", "copy", "move", "rotate", "scale", "mirror", "offset", "array", "fillet",
         "chamfer", "trim", "extend", "break", "join", "constrain", "erase",
     }
     if operation not in known_operations:
         return tool_error(f"Unknown entity operation: {operation}", code="E_UNSUPPORTED_OPERATION")
-    mutating = operation not in {"list", "count", "get"}
+    mutating = operation not in {"list", "count", "get", "get_many"}
     if mutating:
         guard = await _guard_mutation(
             backend, doc_id, expected_revision, lease_token, worker_generation
@@ -1060,6 +1106,8 @@ async def entity(
         result = await backend.entity_count(layer)
     elif operation == "get":
         result = await backend.entity_get_with_semantics(entity_id)
+    elif operation == "get_many":
+        result = await _entity_get_many(backend, data.get("entity_ids"))
     # --- Modify ---
     elif operation == "copy":
         result = await backend.entity_copy(entity_id, data["dx"], data["dy"])
