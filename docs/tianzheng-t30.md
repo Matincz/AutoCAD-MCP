@@ -14,6 +14,7 @@
 - `describe`: 返回完整命令名、中文名称、别名、含义、手册页码和限制。
 - `inspect`: 查询活动命令及模型空间对象的句柄、类型和包围盒。
 - `registry`: 分页检查 CAD 内实际命令登记，只查询，不运行候选命令。
+- `walls`: 只读。`data={insert_handles:[...], max_depth?}`，逐级遍历 INSERT 的块定义（含嵌套块），读取 TDbWall 的 StartPoint/EndPoint/LeftWidth/RightWidth（弧墙另读 Radius/Bulge/Center），按各级插入点、旋转、缩放、镜像和法向变换到 WCS，返回中线、左右边线、墙厚、`mirrored` 与来源路径。
 - `jobs`: 读取服务内任务元数据，不通过 COM 读取正在等待输入的 CAD。
 - `draw_walls`: 用一串坐标自动绘制天正墙。
 - `execute`: 用完整的已核对输入序列自动绘制墙体、插入门窗或创建带形窗。

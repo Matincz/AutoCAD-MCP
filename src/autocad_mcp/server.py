@@ -34,6 +34,7 @@ from autocad_mcp.tianzheng_templates import TEMPLATE_RECIPES, validate_template_
 from autocad_mcp.tianzheng_transforms import TRANSFORM_RECIPES, validate_transform_recipe
 from autocad_mcp.tianzheng_native import native_recipe
 from autocad_mcp.tianzheng_measurements import validate_measurement
+from autocad_mcp.tianzheng_wall_geometry import validate_walls_request
 from autocad_mcp.delivery import deliver_drawing
 from autocad_mcp.drafting import tangent_arc_from_start
 from autocad_mcp.journal import OperationJournal
@@ -2121,6 +2122,10 @@ async def tianzheng(
                 read installed COM interface/type-library metadata, execute no methods.
     measure   — data: {command: TGetExtend or TLengthSumm, selection_handles};
                 read-only world bounds or supported native curve lengths; no annotations.
+    walls     — data: {insert_handles: [1..16 INSERT handles], max_depth?: 1..8};
+                read-only. Walks the block definitions (nested too) and returns every
+                T30 wall in WCS: centerline, left_edge/right_edge (line, or arc with
+                bulge), thickness, mirrored flag, source path and block-local values.
     registry  — data: {query?,category?,offset?,limit?}; read actual AutoCAD command
                 registration for the selected catalogue page without running it.
     start     — data: {command}; starts an allowlisted T30 command and returns job_id.
@@ -2151,6 +2156,7 @@ async def tianzheng(
                     "api_info": {"selection_handles", "library_type_indices"},
                     "set_opening": {"selection_handles", "parameters"},
                     "measure": {"command", "selection_handles"},
+                    "walls": {"insert_handles", "max_depth"},
                     "factory_probe": {"object_type"},
                     "registry": {"query", "category", "offset", "limit"},
                     "start": {"command"}, "input": {"job_id", "response"},
@@ -2175,6 +2181,8 @@ async def tianzheng(
             return _json(CommandResult(ok=True, payload=find_command(d.get("command"))).to_dict())
         if operation == "measure":
             d=validate_measurement(find_command(d.get("command")),d)
+        if operation == "walls":
+            d=validate_walls_request(d)
         if operation == "set_opening":
             d=validate_opening_parameters(d)
         if operation == "registry":

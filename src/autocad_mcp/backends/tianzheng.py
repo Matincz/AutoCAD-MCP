@@ -24,6 +24,7 @@ from autocad_mcp.tianzheng_transforms import TRANSFORM_RECIPES, DISTRIBUTION_REC
 from autocad_mcp.tianzheng import finite_number, TianzhengInputError
 from autocad_mcp.tianzheng_native import native_recipe
 from autocad_mcp.tianzheng import LAYER_SELECTION_RECIPES
+from autocad_mcp.tianzheng_wall_geometry import MAX_WALLS, insert_matrix, matmul, wall_from_bounds, wall_geometry, apply as apply_matrix
 
 
 NATIVE_WATCHDOG_SECONDS = 20.0
@@ -358,6 +359,181 @@ class TianzhengMixin:
                 pass
         return CommandResult(ok=True, payload={"objects": objects, "type_libraries": libraries, "library_interfaces": library_interfaces,
                                                "executed_methods": False, "source": "installed_IDispatch_type_metadata"})
+
+    def _t30_insert_frame(self, reference) -> dict:
+        read = self._t30_read
+        name = str(read(lambda:reference.Name))
+        frame = {"name": name, "insertion": [float(v) for v in read(lambda:reference.InsertionPoint)],
+                 "rotation": float(read(lambda:reference.Rotation)),
+                 "scale": [float(read(lambda:reference.XScaleFactor)), float(read(lambda:reference.YScaleFactor)),
+                           float(read(lambda:reference.ZScaleFactor))]}
+        try:frame["normal"] = [float(v) for v in self._t30_idempotent_call(lambda:reference.Normal)]
+        except Exception:frame["normal"] = [0.0, 0.0, 1.0]
+        for prop, label in (("EffectiveName", "effective_name"), ("Rows", "rows"), ("Columns", "columns")):
+            # Optional members: AttributeError means "not on this class", never retry it.
+            try:frame[label] = self._t30_idempotent_call(lambda:getattr(reference, prop))
+            except Exception:pass
+        return frame
+
+    def _t30_wall_source(self, document, entity, handle: str):
+        """First COM view of a block-resident wall that exposes StartPoint.
+
+        Block.Item can hand back a wrapper bound to the generic entity
+        interface; T30 properties then raise AttributeError on every read.
+        Try the item, HandleToObject, then a late-bound IDispatch, once each:
+        a missing member is not transient, so it is never retried.
+        """
+        attempts = []
+        def candidates():
+            yield "block_item", lambda:entity
+            yield "handle_to_object", lambda:self._t30_idempotent_call(lambda:document.HandleToObject(handle))
+            if sys.platform == "win32":
+                import win32com.client.dynamic
+                yield "late_bound_dispatch", lambda:win32com.client.dynamic.Dispatch(entity._oleobj_)
+        for label, factory in candidates():
+            try:
+                source = factory()
+                self._t30_idempotent_call(lambda:source.StartPoint)
+                attempts.append(label)
+                return source, attempts
+            except Exception as error:
+                attempts.append(f"{label}: {type(error).__name__} {str(error)[:60]}")
+        return None, attempts
+
+    @staticmethod
+    def _t30_interface_members(entity) -> dict:
+        """Member names of an object's IDispatch type info (metadata only, nothing invoked)."""
+        try:
+            info = entity._oleobj_.GetTypeInfo()
+            attr = info.GetTypeAttr()
+            names = set()
+            for index in range(int(attr[7])):  # cFuncs
+                names.add(str(info.GetNames(info.GetFuncDesc(index)[0])[0]))
+            for index in range(int(attr[8])):  # cVars
+                names.add(str(info.GetNames(info.GetVarDesc(index)[0])[0]))
+            return {"interface": str(info.GetDocumentation(-1)[0]), "members": sorted(names)}
+        except Exception as error:
+            return {"error": f"{type(error).__name__}: {str(error)[:120]}"}
+
+    def _t30_block_contents(self, document, name: str, cache: dict) -> dict:
+        """Walls and nested INSERTs of one block definition, block coordinates."""
+        if name in cache:
+            return cache[name]
+        read = self._t30_read
+        optional = lambda entity, prop: self._t30_idempotent_call(lambda:getattr(entity, prop))
+        block = read(lambda:document.Blocks.Item(name))
+        contents = {"origin": [float(v) for v in read(lambda:block.Origin)], "walls": [], "inserts": [], "skipped": []}
+        try:
+            if bool(optional(block, "IsXRef")):
+                contents["skipped"].append({"block": name, "reason": "xref_block_not_traversed"})
+                cache[name] = contents
+                return contents
+        except Exception:
+            pass
+        for index in range(int(read(lambda:block.Count))):
+            entity = read(lambda:block.Item(index))
+            handle = str(read(lambda:entity.Handle)).upper()
+            try:kind = str(optional(entity, "ObjectName"))
+            except Exception:kind = "unreadable_custom_class"
+            upper = kind.upper()
+            if upper in {"ACDBBLOCKREFERENCE", "ACDBMINSERTBLOCK"}:
+                contents["inserts"].append({"handle": handle, "frame": self._t30_insert_frame(entity), "native_class": kind})
+                continue
+            if "WALL" not in upper:
+                continue
+            wall = {"handle": handle, "native_class": kind}
+            try:wall["layer"] = str(optional(entity, "Layer"))
+            except Exception:pass
+            source, attempts = self._t30_wall_source(document, entity, handle)
+            if source is None:
+                wall["error"] = "wall geometry unreadable: " + "; ".join(attempts)[:300]
+                if "<wall_interface>" not in cache:
+                    cache["<wall_interface>"] = self._t30_interface_members(entity)
+            else:
+                wall["access"] = attempts[-1]
+                try:
+                    wall["start"] = [float(v) for v in optional(source, "StartPoint")]
+                    wall["end"] = [float(v) for v in optional(source, "EndPoint")]
+                    wall["left_width"] = float(optional(source, "LeftWidth"))
+                    wall["right_width"] = float(optional(source, "RightWidth"))
+                except Exception as error:
+                    wall["error"] = f"wall geometry unreadable: {str(error)[:160]}"
+                for prop, label, convert in (("Radius", "radius", float), ("Bulge", "bulge", float),
+                                             ("Center", "center", lambda v:[float(c) for c in v])):
+                    try:wall[label] = convert(optional(source, prop))
+                    except Exception:pass
+            try:
+                low, high = read(lambda:entity.GetBoundingBox())
+                wall["bounds_local"] = {"min": [float(v) for v in low], "max": [float(v) for v in high]}
+            except Exception:
+                pass
+            contents["walls"].append(wall)
+        cache[name] = contents
+        return contents
+
+    @sta_async_method("tianzheng.walls", idempotent=True, timeout=90)
+    async def _tianzheng_walls(self, context: dict, data: dict) -> CommandResult:
+        """Read T30 walls under INSERTs (nested blocks too) and transform them to WCS."""
+        _, document = self._t30_document(context)
+        read = self._t30_read
+        cache, walls, inserts, skipped = {}, [], [], []
+
+        def visit(name: str, matrix, path: list, depth: int):
+            contents = self._t30_block_contents(document, name, cache)
+            skipped.extend(contents["skipped"])
+            for wall in contents["walls"]:
+                if len(walls) >= MAX_WALLS:
+                    raise ValueError(f"E_TIANZHENG_WALL_LIMIT: more than {MAX_WALLS} walls under the requested INSERTs")
+                item = {"handle": wall["handle"], "native_class": wall["native_class"], "layer": wall.get("layer"),
+                        "block": name, "path": [step["handle"] for step in path],
+                        "local": {k: wall[k] for k in ("start", "end", "left_width", "right_width", "radius", "bulge", "center") if k in wall}}
+                if "access" in wall:
+                    item["access"] = wall["access"]
+                if "error" in wall:
+                    item["error"] = wall["error"]
+                else:
+                    item.update(wall_geometry(item["local"], matrix))
+                if "bounds_local" in wall:
+                    corners = [apply_matrix(matrix, [x, y, z]) for x in (wall["bounds_local"]["min"][0], wall["bounds_local"]["max"][0])
+                               for y in (wall["bounds_local"]["min"][1], wall["bounds_local"]["max"][1])
+                               for z in (wall["bounds_local"]["min"][2], wall["bounds_local"]["max"][2])]
+                    item["bounds_wcs"] = {"min": [round(min(c[i] for c in corners), 6) for i in range(3)],
+                                          "max": [round(max(c[i] for c in corners), 6) for i in range(3)]}
+                    if "error" in item:
+                        item["inferred_from_bounds"] = wall_from_bounds(item["bounds_wcs"], matrix)
+                walls.append(item)
+            for child in contents["inserts"]:
+                step = {"handle": child["handle"], "block": child["frame"]["name"]}
+                frame = child["frame"]
+                if child["native_class"].upper() == "ACDBMINSERTBLOCK" and (int(frame.get("rows", 1)) > 1 or int(frame.get("columns", 1)) > 1):
+                    skipped.append({**step, "reason": "minsert_array_not_expanded"})
+                    continue
+                if depth >= data["max_depth"]:
+                    skipped.append({**step, "reason": "max_depth_reached"})
+                    continue
+                child_origin = self._t30_block_contents(document, frame["name"], cache)["origin"]
+                child_matrix = matmul(matrix, insert_matrix(frame["insertion"], frame["rotation"], frame["scale"], child_origin, frame["normal"]))
+                visit(frame["name"], child_matrix, path + [step], depth + 1)
+
+        for handle in data["insert_handles"]:
+            try:reference = read(lambda:document.HandleToObject(handle))
+            except Exception:
+                return _failure("E_ENTITY_NOT_FOUND", f"INSERT {handle} not found in the active drawing", handle=handle)
+            try:kind = str(read(lambda:reference.ObjectName))
+            except Exception:kind = ""
+            if kind.upper() not in {"ACDBBLOCKREFERENCE", "ACDBMINSERTBLOCK"}:
+                return _failure("E_TIANZHENG_OBJECT_TYPE", f"{handle} is {kind or 'unknown'}, not an INSERT", handle=handle)
+            frame = self._t30_insert_frame(reference)
+            origin = self._t30_block_contents(document, frame["name"], cache)["origin"]
+            matrix = insert_matrix(frame["insertion"], frame["rotation"], frame["scale"], origin, frame["normal"])
+            inserts.append({"handle": handle, **frame, "block_origin": origin})
+            visit(frame["name"], matrix, [{"handle": handle, "block": frame["name"]}], 1)
+        return CommandResult(ok=True, payload={"inserts": inserts, "walls": walls, "count": len(walls),
+            "errors": [w["handle"] for w in walls if "error" in w], "skipped": skipped,
+            **({"wall_interface": cache["<wall_interface>"]} if "<wall_interface>" in cache else {}),
+            "coordinates": "WCS", "units": "drawing_units", "writes_drawing": False,
+            "side_semantics": "left_edge is the LeftWidth side of the wall's own start->end direction; mirrored=true means it appears on the right in WCS",
+            "execution_transport": "AutoCAD.ActiveX.read_block_definitions"})
 
     def _t30_set_property(self, entity, prop: str, value):
         if isinstance(value,(list,tuple)) and sys.platform == "win32":
@@ -1111,6 +1287,7 @@ class TianzhengMixin:
 
     async def tianzheng_command(self, operation: str, context: dict, data: dict) -> CommandResult:
         if operation=="measure":return await self._tianzheng_measure(context,data)
+        if operation=="walls":return await self._tianzheng_walls(context,data)
         if operation=="set_opening":return await self._tianzheng_set_opening(context,data)
         if operation == "execute" and native_recipe(data["command"]) is not None:
             return await self._tianzheng_native(context,data)
