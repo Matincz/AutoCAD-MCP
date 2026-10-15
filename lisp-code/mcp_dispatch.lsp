@@ -1342,35 +1342,43 @@
   (setq lineweight (mcp-json-get-string params "lineweight"))
   (if (not (tblsearch "LAYER" name))
     (cons nil (strcat "Layer not found: " name))
-    (progn
-      (mcp-update-layer-properties name color linetype lineweight)
+    (if (mcp-update-layer-properties name color linetype lineweight)
       (cons T (strcat "{\"name\":\"" (mcp-escape-string name) "\"}"))
+      (cons nil *mcp-layer-error*)
     )
   )
 )
 
 (defun mcp-cmd-layer-freeze (params / name)
   (setq name (mcp-json-get-string params "name"))
-  (mcp-set-layer-flag name 1 T)
-  (cons T (strcat "{\"name\":\"" name "\",\"frozen\":true}"))
+  (if (mcp-set-layer-flag name 1 T)
+    (cons T (strcat "{\"name\":\"" (mcp-escape-string name) "\",\"frozen\":true}"))
+    (cons nil *mcp-layer-error*)
+  )
 )
 
 (defun mcp-cmd-layer-thaw (params / name)
   (setq name (mcp-json-get-string params "name"))
-  (mcp-set-layer-flag name 1 nil)
-  (cons T (strcat "{\"name\":\"" name "\",\"frozen\":false}"))
+  (if (mcp-set-layer-flag name 1 nil)
+    (cons T (strcat "{\"name\":\"" (mcp-escape-string name) "\",\"frozen\":false}"))
+    (cons nil *mcp-layer-error*)
+  )
 )
 
 (defun mcp-cmd-layer-lock (params / name)
   (setq name (mcp-json-get-string params "name"))
-  (mcp-set-layer-flag name 4 T)
-  (cons T (strcat "{\"name\":\"" name "\",\"locked\":true}"))
+  (if (mcp-set-layer-flag name 4 T)
+    (cons T (strcat "{\"name\":\"" (mcp-escape-string name) "\",\"locked\":true}"))
+    (cons nil *mcp-layer-error*)
+  )
 )
 
 (defun mcp-cmd-layer-unlock (params / name)
   (setq name (mcp-json-get-string params "name"))
-  (mcp-set-layer-flag name 4 nil)
-  (cons T (strcat "{\"name\":\"" name "\",\"locked\":false}"))
+  (if (mcp-set-layer-flag name 4 nil)
+    (cons T (strcat "{\"name\":\"" (mcp-escape-string name) "\",\"locked\":false}"))
+    (cons nil *mcp-layer-error*)
+  )
 )
 
 ;; --- Block operations (insert-with-attributes, get-attributes, update-attribute) ---
@@ -1766,11 +1774,32 @@
   )
 )
 
-(defun mcp-update-layer-properties (name color linetype lineweight / data actual)
-  (setq data (tblsearch "LAYER" name))
-  (if data
+;; Last layer-table failure, for callers that report errors.
+(setq *mcp-layer-error* nil)
+
+(defun mcp-remove-dxf (data code / out)
+  (foreach item data (if (/= (car item) code) (setq out (cons item out))))
+  (reverse out)
+)
+
+(defun mcp-update-layer-properties (name color linetype lineweight / obj data actual old new after)
+  "Modify a layer through its full record; tblsearch output has no -1 entity name for entmod.
+Returns the linetype in effect, or nil with *mcp-layer-error* set."
+  (setq *mcp-layer-error* nil)
+  (setq obj (tblobjname "LAYER" name))
+  (if (not obj)
+    (progn (setq *mcp-layer-error* (strcat "Layer not found: " name)) nil)
     (progn
-      (if color (setq data (mcp-put-dxf data 62 (mcp-color-index color))))
+      (setq data (entget obj))
+      (if color
+        (progn
+          ;; A negative 62 means the layer is off; keep that state.
+          (setq old (cdr (assoc 62 data)) new (abs (mcp-color-index color)))
+          (setq data (mcp-put-dxf data 62 (if (and old (< old 0)) (- new) new)))
+          ;; True/book colors (420/430) take precedence over 62.
+          (setq data (mcp-remove-dxf (mcp-remove-dxf data 420) 430))
+        )
+      )
       (if linetype
         (progn
           (setq actual (mcp-ensure-linetype linetype))
@@ -1780,11 +1809,23 @@
       (if lineweight
         (setq data (mcp-put-dxf data 370 (mcp-lineweight-value lineweight)))
       )
-      (entmod data)
-      (entupd (tblobjname "LAYER" name))
+      (if (not (entmod data))
+        (progn (setq *mcp-layer-error* (strcat "AutoCAD rejected the layer change: " name)) nil)
+        (progn
+          (setq after (entget obj))
+          (cond
+            ((and color (or (/= (cdr (assoc 62 after)) (cdr (assoc 62 data))) (assoc 420 after)))
+              (setq *mcp-layer-error* (strcat "Layer color did not change: " name)) nil)
+            ((and lineweight (/= (cdr (assoc 370 after)) (cdr (assoc 370 data))))
+              (setq *mcp-layer-error* (strcat "Layer lineweight did not change: " name)) nil)
+            ((and actual (/= (strcase (cdr (assoc 6 after))) (strcase actual)))
+              (setq *mcp-layer-error* (strcat "Layer linetype did not change: " name)) nil)
+            (t (cdr (assoc 6 after)))
+          )
+        )
+      )
     )
   )
-  (if actual actual (if (assoc 6 data) (cdr (assoc 6 data)) "CONTINUOUS"))
 )
 
 (defun mcp-upsert-layer (name color linetype lineweight / actual data)
@@ -1805,20 +1846,26 @@
   actual
 )
 
-(defun mcp-set-layer-flag (name bit enabled / data flags)
-  (setq data (tblsearch "LAYER" name))
-  (if data
-    (progn
+(defun mcp-set-layer-flag (name bit enabled / obj data flags)
+  "Set or clear a LAYER flag bit (1 frozen, 4 locked). Returns T, or nil with *mcp-layer-error* set."
+  (setq *mcp-layer-error* nil)
+  (setq obj (tblobjname "LAYER" name))
+  (cond
+    ((not obj) (setq *mcp-layer-error* (strcat "Layer not found: " name)) nil)
+    ((and enabled (= bit 1) (= (strcase name) (strcase (getvar "CLAYER"))))
+      (setq *mcp-layer-error* (strcat "Cannot freeze the current layer: " name)) nil)
+    (t
+      (setq data (entget obj))
       (setq flags (if (assoc 70 data) (cdr (assoc 70 data)) 0))
-      (if enabled
-        (setq flags (logior flags bit))
-        (if (= (logand flags bit) bit) (setq flags (- flags bit)))
+      (setq flags (if enabled (logior flags bit) (logand flags (~ bit))))
+      (cond
+        ((not (entmod (mcp-put-dxf data 70 flags)))
+          (setq *mcp-layer-error* (strcat "AutoCAD rejected the layer flag change: " name)) nil)
+        ((/= (logand (cdr (assoc 70 (entget obj))) bit) (if enabled bit 0))
+          (setq *mcp-layer-error* (strcat "Layer flag did not change: " name)) nil)
+        (t T)
       )
-      (entmod (mcp-put-dxf data 70 flags))
-      (entupd (tblobjname "LAYER" name))
-      T
     )
-    nil
   )
 )
 
