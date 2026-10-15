@@ -25,6 +25,7 @@ ERROR_ACTIONS = {
     "E_OUTPUT_LOCKED": (True, "close_the_file_owner_and_retry"),
     "E_DISPATCHER_NOT_LOADED": (True, "autoload_dispatcher"),
     "E_DISPATCHER_VERSION_MISMATCH": (True, "reload_dispatcher"),
+    "E_DISPATCHER_NOT_TRUSTED": (False, "user_adds_dispatcher_folder_to_this_autocad_versions_trusted_locations"),
     "E_IPC_TIMEOUT": (True, "recover_and_retry"),
     "E_COMMAND_STATE_BLOCKED": (True, "cancel_active_command"),
     "E_OUTPUT_PATH_REJECTED": (False, "use_managed_output_workspace"),

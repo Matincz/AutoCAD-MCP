@@ -14,6 +14,7 @@ import asyncio
 import hashlib
 import json
 import math
+import ntpath
 import os
 import re
 import shutil
@@ -118,6 +119,40 @@ def _dispatcher_load_expression(path: str) -> str:
     LISP-path request timed out there.
     """
     return f'(if vl-load-all (vl-load-all "{path}") (load "{path}"))'
+
+
+def dispatcher_trust_issue(
+    path: str, secureload, trustedpaths
+) -> dict | None:
+    """Return why loading ``path`` would raise AutoCAD's SECURELOAD prompt.
+
+    That prompt is modal and blocks COM ``SendCommand`` until a human answers,
+    which times out and quarantines the STA worker. Each AutoCAD release keeps
+    its own TRUSTEDPATHS, so a folder trusted in one version is not trusted in
+    another. ``None`` means no prompt is expected or the state is unknown.
+    """
+    try:
+        level = int(secureload)
+    except (TypeError, ValueError):
+        return None
+    if level == 0:
+        return None
+    folder = ntpath.normcase(ntpath.normpath(ntpath.dirname(path)))
+    for raw in str(trustedpaths or "").split(";"):
+        entry = ntpath.expandvars(raw.strip().strip('"'))
+        if not entry:
+            continue
+        recursive = entry.endswith("\\...")
+        if recursive:
+            entry = entry[:-4]
+        trusted = ntpath.normcase(ntpath.normpath(entry))
+        if folder == trusted or (recursive and folder.startswith(trusted.rstrip("\\") + "\\")):
+            return None
+    return {
+        "secureload": level,
+        "dispatcher_folder": ntpath.dirname(path),
+        "trustedpaths": str(trustedpaths or ""),
+    }
 
 
 def find_autocad_window(preferred_process_id: int | None = None) -> int | None:
@@ -874,6 +909,7 @@ class FileIPCBackend(TianzhengMixin, AutoCADBackend):
                     "loaded": False,
                     "error": compat.error,
                     "error_code": compat.error_code,
+                    "details": compat.payload,
                 },
                 "autocad": {
                     **self._product_info,
@@ -934,6 +970,24 @@ class FileIPCBackend(TianzhengMixin, AutoCADBackend):
             if not candidate.is_file():
                 continue
             normalized_path = str(candidate.resolve()).replace("\\", "/")
+            security = self._read_secure_load_state()
+            issue = dispatcher_trust_issue(
+                str(candidate.resolve()),
+                security.get("SECURELOAD"),
+                security.get("TRUSTEDPATHS"),
+            )
+            if issue:
+                return CommandResult(
+                    ok=False,
+                    error=(
+                        "Loading the MCP dispatcher would open AutoCAD's SECURELOAD "
+                        "prompt and block COM; add its folder to this AutoCAD "
+                        "version's trusted locations (Options > Files > Trusted "
+                        "Locations), then retry ensure_ready"
+                    ),
+                    error_code="E_DISPATCHER_NOT_TRUSTED",
+                    payload={**issue, "profile": security.get("CPROFILE"), "dispatcher_path": str(candidate.resolve())},
+                )
             for attempt in range(1, 4):
                 load_attempts += 1
                 self._type_command(_dispatcher_load_expression(normalized_path))
@@ -1994,6 +2048,20 @@ class FileIPCBackend(TianzhengMixin, AutoCADBackend):
         # command could possibly arrive in AutoCAD.  Keep the failure at the
         # transport boundary so callers receive a bounded, actionable result.
         return bool(self._type_command("(c:mcp-dispatch)"))
+
+    @sta_sync_method("autocad.secure_load_state", idempotent=True)
+    def _read_secure_load_state(self) -> dict:
+        """Read SECURELOAD/TRUSTEDPATHS; empty when unavailable (never blocks load)."""
+        if sys.platform != "win32":
+            return {}
+        try:
+            document = self._get_autocad_application().ActiveDocument
+            return {
+                name: document.GetVariable(name)
+                for name in ("SECURELOAD", "TRUSTEDPATHS", "CPROFILE")
+            }
+        except Exception:
+            return {}
 
     @sta_sync_method("autocad.wait_idle", idempotent=True, timeout=15.0)
     def _wait_for_autocad_idle(self, timeout: float = 2.0) -> bool:

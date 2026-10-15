@@ -714,3 +714,20 @@ def test_ipc_request_keeps_chinese_in_ansi_and_escapes_the_rest():
 
     fallback = file_ipc._encode_ipc_request({"text": "客厅 😀"}, "cp936")
     assert fallback == b'{"text": "\\u5ba2\\u5385 \\ud83d\\ude00"}'
+
+
+def test_dispatcher_trust_issue_detects_untrusted_folder_per_release(monkeypatch):
+    from autocad_mcp.backends.file_ipc import dispatcher_trust_issue
+
+    path = r"C:\Users\me\AutoCAD-MCP\lisp-code\mcp_dispatch.lsp"
+    assert dispatcher_trust_issue(path, 0, "") is None
+    assert dispatcher_trust_issue(path, None, "") is None
+    assert dispatcher_trust_issue(path, 1, r"c:\users\me\autocad-mcp\LISP-CODE") is None
+    assert dispatcher_trust_issue(path, 1, r'D:\x;"C:\Users\me\AutoCAD-MCP\..."') is None
+    issue = dispatcher_trust_issue(path, 1, r"C:\Program Files\Autodesk\AutoCAD 2022\Support")
+    assert issue["dispatcher_folder"] == r"C:\Users\me\AutoCAD-MCP\lisp-code"
+    assert issue["secureload"] == 1
+    monkeypatch.setenv("USERPROFILE", r"C:\Users\me")
+    assert dispatcher_trust_issue(path, 1, r"%USERPROFILE%\AutoCAD-MCP\lisp-code;") is None
+    # a non-recursive parent entry does not trust the child folder
+    assert dispatcher_trust_issue(path, 2, r"C:\Users\me\AutoCAD-MCP") is not None
