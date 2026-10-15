@@ -57,7 +57,7 @@ rendering and final rotation so no viewer or camera motion interrupts capture.
 | **File IPC compatibility** | Windows Python | Full AutoCAD or AutoCAD LT 2024+ | COM/LISP coverage, topology audit, PDF and PNG |
 | **ezdxf** | Any platform | No (headless) | Structured audit + deterministic PNG |
 
-The server exposes **12 consolidated tools** (`drawing`, `entity`, `solid`, `product`, `layer`, `block`, `annotation`, `pid`, `transaction`, `view`, `job`, `system`) over standard MCP stdio.
+The server exposes **13 consolidated tools** (`drawing`, `entity`, `solid`, `product`, `layer`, `block`, `annotation`, `pid`, `transaction`, `view`, `job`, `system`, `tianzheng`) over standard MCP stdio or Streamable HTTP. The [Tianzheng T30 guide](docs/tianzheng-t30.md) distinguishes the 500-entry command catalogue from the 27 currently verified recipes and the pending template candidates.
 
 This edition is based on [puran-water/autocad-mcp](https://github.com/puran-water/autocad-mcp) and retains its MIT license. Version 4.0 adds a native transactional worker, client-independent named-pipe protocol, external desktop supervisor, durable idempotency journal, and database-owned document revisions while retaining COM/LISP compatibility.
 

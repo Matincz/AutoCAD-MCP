@@ -28,6 +28,7 @@ import structlog
 from autocad_mcp import __version__
 from autocad_mcp.audit import INSUNITS_NAMES, audit_dxf_file, build_audit, geometry_digest
 from autocad_mcp.backends.base import AutoCADBackend, BackendCapabilities, CommandResult
+from autocad_mcp.backends.tianzheng import TianzhengMixin
 from autocad_mcp.com_sta import ComStaExecutor, com_hresult, sta_async_method, sta_sync_method
 from autocad_mcp.config import (
     AutoCADStartupError,
@@ -559,7 +560,7 @@ def _com_entity_to_dict(entity) -> dict:
     return {key: value for key, value in result.items() if value is not None}
 
 
-class FileIPCBackend(AutoCADBackend):
+class FileIPCBackend(TianzhengMixin, AutoCADBackend):
     """File IPC for full AutoCAD and AutoCAD LT via mcp_dispatch.lsp."""
 
     def __init__(self, *, com_executor: ComStaExecutor | None = None):
@@ -690,28 +691,35 @@ class FileIPCBackend(AutoCADBackend):
         """
         import win32com.client
 
-        application = win32com.client.GetActiveObject("AutoCAD.Application")
         expected_pid = int(self._acad_process_id or 0)
         expected_hwnd = int(self._hwnd or 0)
-        actual_hwnd = int(getattr(application, "HWND", 0) or 0)
-        if expected_pid:
-            if not actual_hwnd:
-                raise RuntimeError(
-                    "E_AUTOCAD_INSTANCE_UNVERIFIED: COM application has no HWND "
-                    f"for expected PID {expected_pid}"
-                )
-            actual_pid = _window_process_id(actual_hwnd)
-            if actual_pid != expected_pid:
-                raise RuntimeError(
-                    "E_AUTOCAD_INSTANCE_MISMATCH: COM HWND/PID does not match "
-                    f"selected AutoCAD PID {expected_pid} (actual PID {actual_pid})"
-                )
-        elif expected_hwnd and actual_hwnd and actual_hwnd != expected_hwnd:
-            raise RuntimeError(
-                "E_AUTOCAD_INSTANCE_MISMATCH: COM HWND does not match the "
-                f"selected AutoCAD HWND {expected_hwnd} (actual HWND {actual_hwnd})"
-            )
-        return application
+        # Some installations register only the versioned ProgID. GetActiveObject
+        # attaches to a running instance; never Dispatch/CreateObject here, as
+        # that could silently start a second CAD process.
+        candidates = ("AutoCAD.Application", "AutoCAD.Application.25",
+                      "AutoCAD.Application.25.0", "AutoCAD.Application.25.1",
+                      "AutoCAD.Application.24.3", "AutoCAD.Application.24.2",
+                      "AutoCAD.Application.24.1", "AutoCAD.Application.24")
+        last_error = None
+        for progid in candidates:
+            try:
+                application = win32com.client.GetActiveObject(progid)
+                actual_hwnd = int(getattr(application, "HWND", 0) or 0)
+                if expected_pid:
+                    if not actual_hwnd:
+                        raise RuntimeError("E_AUTOCAD_INSTANCE_UNVERIFIED: COM application has no HWND")
+                    actual_pid = _window_process_id(actual_hwnd)
+                    if actual_pid != expected_pid:
+                        raise RuntimeError(
+                            "E_AUTOCAD_INSTANCE_MISMATCH: COM HWND/PID does not match "
+                            f"selected AutoCAD PID {expected_pid} (actual PID {actual_pid})")
+                elif expected_hwnd and actual_hwnd != expected_hwnd:
+                    raise RuntimeError("E_AUTOCAD_INSTANCE_MISMATCH: COM HWND does not match selected AutoCAD HWND")
+                return application
+            except Exception as error:
+                last_error = error
+        raise RuntimeError(
+            f"E_AUTOCAD_COM_UNAVAILABLE: no running COM ProgID matched the selected CAD process: {last_error}") from last_error
 
     def _native_window_policy(self, *, activate: bool = False) -> dict:
         """Apply the UI policy through user32 without requiring COM/pywin32."""

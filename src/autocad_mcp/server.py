@@ -1,7 +1,7 @@
 """AutoCAD MCP Server v4.0 — consolidated tools with operation dispatch.
 
 Tools: drawing, entity, solid, product, layer, block, annotation, pid,
-transaction, view, job, and system.
+transaction, view, job, system, and tianzheng.
 """
 
 from __future__ import annotations
@@ -27,6 +27,12 @@ from autocad_mcp.client import (
     tool_error,
 )
 from autocad_mcp.contracts import build_entity_expectation
+from autocad_mcp.tianzheng import GLOBAL_DISPLAY_RECIPES, GLOBAL_LAYER_RECIPES, TianzhengInputError, compile_drawing_recipe, compile_global_recipe, compile_selection_recipe, encode_response, find_command, list_commands
+from autocad_mcp.tianzheng_properties import PROPERTY_RECIPES, validate_property_recipe, validate_opening_parameters
+from autocad_mcp.tianzheng_templates import TEMPLATE_RECIPES, validate_template_recipe
+from autocad_mcp.tianzheng_transforms import TRANSFORM_RECIPES, validate_transform_recipe
+from autocad_mcp.tianzheng_native import native_recipe
+from autocad_mcp.tianzheng_measurements import validate_measurement
 from autocad_mcp.delivery import deliver_drawing
 from autocad_mcp.drafting import tangent_arc_from_start
 from autocad_mcp.journal import OperationJournal
@@ -2039,6 +2045,187 @@ async def view(
         )
     else:
         return tool_error(f"Unknown view operation: {operation}", code="E_UNSUPPORTED_OPERATION")
+
+
+# ==========================================================================
+# Tianzheng T30 — documented commands, guarded interactive sessions
+# ==========================================================================
+
+
+@mcp.tool(annotations={"title": "Tianzheng T30 Commands", "readOnlyHint": False})
+@_safe("tianzheng")
+async def tianzheng(
+    operation: str,
+    doc_id: str | None = None,
+    expected_revision: int | None = None,
+    lease_token: str | None = None,
+    worker_generation: int | None = None,
+    idempotency_key: str | None = None,
+    data: dict | None = None,
+) -> ToolResult:
+    """Tianzheng T30 catalogue and real custom-object command sessions.
+
+    catalogue — data: {query?, category?, offset?, limit?}. No CAD connection needed.
+    describe  — data: {command}; meaning, aliases, manual pages and evidence limits.
+    inspect   — read active command state and model-space handles/types/bounds.
+    jobs      — server session metadata only; usable while interactive CAD is busy.
+    api_info  — data: {selection_handles: [1..4 existing model-space handles]};
+                read installed COM interface/type-library metadata, execute no methods.
+    measure   — data: {command: TGetExtend or TLengthSumm, selection_handles};
+                read-only world bounds or supported native curve lengths; no annotations.
+    registry  — data: {query?,category?,offset?,limit?}; read actual AutoCAD command
+                registration for the selected catalogue page without running it.
+    start     — data: {command}; starts an allowlisted T30 command and returns job_id.
+    execute   — data: {command, points: [[x,y,z],...], wall_handles?}; complete
+                recipe for TGWall, TOpening or TBanWin using current T30 defaults.
+                TBanWin requires two positions and existing T30 wall_handles.
+                The six ALX/ALY alignment commands instead require selection_handles.
+    draw_walls — data: {points: [[x,y,z],...]}; convenience TGWall recipe.
+    set_opening — data: {selection_handles:[handle], parameters:{kind,width,height,sill}};
+                candidate ordinary door/window properties; host association is not yet verified.
+    input     — data: {job_id, response: {type,value?}}. Exactly one prompt response.
+                type: point ([x,y] or [x,y,z]), number, selection ([hex handles]),
+                keyword (only documented choices), or enter (omit value).
+    status    — data: {job_id}; distinguishes awaiting_input from completed and
+                verifies created TCH object classes independently of command delivery.
+    cancel    — data: {job_id}; cancels only this job, retaining already drawn objects.
+
+    start/execute/draw_walls/set_opening/input/cancel require fresh context and idempotency_key.
+    AutoCAD 2015+ requires execute for automated drawing; input is legacy-only.
+    Read context before every mutation; use a newly created test drawing for tests.
+    Interactive sessions are not atomic database transactions. T30's current dialog
+    defaults determine dimensions/materials. No raw commands/LISP/macros or file
+    paths are accepted. File/library/export operations require dedicated adapters.
+    """
+    d = data or {}
+    allowed_keys = {"catalogue": {"query", "category", "offset", "limit"},
+                    "describe": {"command"}, "inspect": set(), "jobs": set(),
+                    "api_info": {"selection_handles", "library_type_indices"},
+                    "set_opening": {"selection_handles", "parameters"},
+                    "measure": {"command", "selection_handles"},
+                    "factory_probe": {"object_type"},
+                    "registry": {"query", "category", "offset", "limit"},
+                    "start": {"command"}, "input": {"job_id", "response"},
+                    "execute": {"command", "points", "wall_handles", "selection_handles", "parameters", "template_handle"}, "draw_walls": {"points"},
+                    "status": {"job_id"}, "cancel": {"job_id"}, "escape": {"document_name"}}
+    if operation not in allowed_keys or set(d) - allowed_keys.get(operation, set()):
+        return _json(CommandResult(ok=False, error="Unsupported Tianzheng operation or parameter",
+                                   error_code="E_TIANZHENG_PARAMETER_REJECTED").to_dict())
+    if operation == "escape":
+        # Recovery only: AutoCAD rejects COM while waiting at a prompt, so this
+        # bypasses the COM document guard and posts two ESC key messages after
+        # checking PID, managed test-drawing path and window title.
+        backend = await get_backend()
+        if not hasattr(backend, "tianzheng_escape"):
+            return _json(CommandResult(ok=False, error="escape needs the Windows AutoCAD backend",
+                                       error_code="E_UNSUPPORTED_OPERATION").to_dict())
+        return _json(backend.tianzheng_escape(d.get("document_name")).to_dict())
+    try:
+        if operation == "catalogue":
+            return _json(CommandResult(ok=True, payload=list_commands(**d)).to_dict())
+        if operation == "describe":
+            return _json(CommandResult(ok=True, payload=find_command(d.get("command"))).to_dict())
+        if operation == "measure":
+            d=validate_measurement(find_command(d.get("command")),d)
+        if operation == "set_opening":
+            d=validate_opening_parameters(d)
+        if operation == "registry":
+            page = list_commands(**d)
+            d = {"entries":page["commands"]}
+        if operation == "api_info":
+            encode_response(find_command("TGWall"), {"type":"selection", "value":d.get("selection_handles")})
+            if len(d["selection_handles"]) > 4:
+                raise TianzhengInputError("API metadata lookup accepts at most four handles")
+            indices = d.get("library_type_indices", [])
+            if not isinstance(indices,list) or len(indices) > 8 or any(isinstance(i,bool) or not isinstance(i,int) or not 0 <= i < 1024 for i in indices):
+                raise TianzhengInputError("Type indices must be at most eight integers between 0 and 1023")
+        if operation == "factory_probe":
+            return _json(CommandResult(ok=False,error="Direct custom-object factories are disabled after a column probe timed out and left an invalid object; use verified command or property recipes",error_code="E_TIANZHENG_FACTORY_DISABLED").to_dict())
+        if operation == "draw_walls":
+            operation = "execute"
+            d = {"command": "TGWall", "points": d.get("points")}
+        if operation in {"start", "execute"}:
+            entry = find_command(d.get("command"))
+            if entry["automation"] != "interactive":
+                return _json(CommandResult(ok=False,
+                    error="This command requires a verified file/output adapter or spelling verification",
+                    error_code="E_TIANZHENG_ADAPTER_REQUIRED", payload=entry).to_dict())
+            if operation == "execute":
+                if native_recipe(entry["command"]) is not None:
+                    d = native_recipe(entry["command"]).validate(entry,d)
+                elif entry["command"].upper() in TRANSFORM_RECIPES:
+                    d = validate_transform_recipe(entry,d)
+                elif "template_handle" in d:
+                    if entry["command"].upper() not in TEMPLATE_RECIPES:
+                        raise TianzhengInputError("Initialized templates are only available for standard columns and rectangles")
+                    d = validate_template_recipe(entry,d)
+                elif entry["command"].upper() in PROPERTY_RECIPES:
+                    if "points" in d or "wall_handles" in d:
+                        raise TianzhengInputError("Property recipes accept only selection_handles and parameters")
+                    parameters = validate_property_recipe(entry,d.get("selection_handles"),d.get("parameters"))
+                    d = {"command": entry["command"], "selection_handles":d["selection_handles"], "parameters":parameters}
+                elif "parameters" in d:
+                    raise TianzhengInputError("This recipe does not accept parameters")
+                elif "selection_handles" in d:
+                    if "points" in d or "wall_handles" in d:
+                        raise TianzhengInputError("Selection and drawing recipes cannot be combined")
+                    compile_selection_recipe(entry, d["selection_handles"])
+                    d = {"command": entry["command"], "selection_handles": d["selection_handles"]}
+                elif entry["command"].upper() in GLOBAL_LAYER_RECIPES or entry["command"].upper() in GLOBAL_DISPLAY_RECIPES:
+                    if "points" in d or "wall_handles" in d:
+                        raise TianzhengInputError("Global layer commands accept no geometry parameters")
+                    compile_global_recipe(entry)
+                    d = {"command": entry["command"]}
+                else:
+                    compile_drawing_recipe(entry, d.get("points"), d.get("wall_handles"))
+                    d = {"command": entry["command"], "points": d["points"],
+                         **({"wall_handles":d["wall_handles"]} if "wall_handles" in d else {})}
+            else:
+                d = {"command": entry["command"]}
+        if operation in {"input", "status", "cancel"}:
+            if not isinstance(d.get("job_id"), str) or not d["job_id"].startswith("t30-"):
+                raise TianzhengInputError("A Tianzheng job_id from start is required")
+        if operation == "input" and not isinstance(d.get("response"), dict):
+            raise TianzhengInputError("input requires a structured response")
+    except TianzhengInputError as error:
+        return _json(CommandResult(ok=False, error=str(error), error_code=error.error_code).to_dict())
+
+    modifying = operation in {"start", "execute", "set_opening", "input", "cancel", "factory_probe"}
+    if modifying and (not isinstance(idempotency_key, str) or not idempotency_key.strip()):
+        return _json(CommandResult(ok=False, error="Tianzheng mutations require a unique idempotency_key",
+                                   error_code="E_IDEMPOTENCY_KEY_REQUIRED").to_dict())
+    backend = await get_backend()
+    if not hasattr(backend, "tianzheng_command"):
+        return _json(CommandResult(ok=False, error="Tianzheng needs live Windows AutoCAD with T30 loaded",
+                                   error_code="E_UNSUPPORTED_OPERATION").to_dict())
+    if modifying:
+        replay = _begin_journaled_mutation(idempotency_key, operation=f"tianzheng.{operation}",
+            request={"doc_id": doc_id, "expected_revision": expected_revision,
+                     "lease_token": lease_token, "worker_generation": worker_generation, "data": d},
+            context=None)
+        if replay is not None:
+            return _json(replay.to_dict())
+        guard = await _guard_mutation(backend, doc_id, expected_revision, lease_token, worker_generation)
+    else:
+        guard = await _guard_document_read(backend, doc_id)
+    if not guard.ok:
+        return _json((_finish_journaled_mutation(idempotency_key, guard) if modifying else guard).to_dict())
+    try:
+        if operation in {"start", "execute"} and hasattr(backend, "_native_window_policy"):
+            backend._native_window_policy(activate=True)
+        result = await backend.tianzheng_command(operation, guard.payload, d)
+    except (TianzhengInputError, ValueError) as error:
+        code = getattr(error, "error_code", "E_TIANZHENG_PARAMETER_REJECTED")
+        if str(error).startswith("E_DOCUMENT_ID_MISMATCH"):
+            code = "E_DOCUMENT_ID_MISMATCH"
+        elif str(error).startswith("E_TIANZHENG_JOB_MISMATCH"):
+            code = "E_TIANZHENG_JOB_MISMATCH"
+        result = CommandResult(ok=False, error=str(error), error_code=code)
+    if result.ok:
+        result = await _attach_document_context(backend, result, doc_id=doc_id, mutated=modifying)
+    if modifying:
+        result = _finish_journaled_mutation(idempotency_key, result)
+    return _json(result.to_dict())
 
 
 # ==========================================================================
