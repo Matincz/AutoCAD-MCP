@@ -10,6 +10,10 @@ import uuid
 import ntpath
 import math
 import sys
+import time
+from functools import wraps
+
+import structlog
 
 from autocad_mcp.backends.base import CommandResult
 from autocad_mcp.com_sta import sta_async_method, com_hresult, RETRYABLE_HRESULTS
@@ -23,6 +27,23 @@ from autocad_mcp.tianzheng import LAYER_SELECTION_RECIPES
 
 
 NATIVE_WATCHDOG_SECONDS = 20.0
+log = structlog.get_logger()
+
+
+def _timed_read(method):
+    """One record per STA read phase, including failures; no per-getter logging."""
+    @wraps(method)
+    def timed(*args, **kwargs):
+        started = time.perf_counter()
+        completed = False
+        try:
+            result = method(*args, **kwargs)
+            completed = True
+            return result
+        finally:
+            log.info(f"tianzheng.read.{method.__name__.removeprefix('_t30_')}", completed=completed,
+                     duration_ms=round((time.perf_counter() - started) * 1000, 3))
+    return timed
 
 
 def _jsonable(value):
@@ -90,16 +111,19 @@ class TianzhengMixin:
         return {"command_active": int(document.GetVariable("CMDACTIVE")),
                 "command_names": str(document.GetVariable("CMDNAMES") or "")}
 
+    @_timed_read
     def _t30_environment(self, document) -> dict:
         layers = {}
         read = self._t30_read
-        for index in range(int(read(lambda:document.Layers.Count))):
-            layer = read(lambda:document.Layers.Item(index))
+        collection = read(lambda:document.Layers)
+        for index in range(int(read(lambda:collection.Count))):
+            layer = read(lambda:collection.Item(index))
             layers[str(read(lambda:layer.Name))] = {"on": bool(read(lambda:layer.LayerOn)), "frozen": bool(read(lambda:layer.Freeze)),
                                       "locked": bool(read(lambda:layer.Lock)), "color": int(read(lambda:layer.Color)),
                                       "linetype": str(read(lambda:layer.Linetype))}
         return {"layers": layers, "current_layer": str(read(lambda:document.GetVariable("CLAYER")))}
 
+    @_timed_read
     def _t30_snapshot(self, document) -> dict:
         space = self._t30_idempotent_call(lambda:document.ModelSpace)
         count = int(self._t30_idempotent_call(lambda:space.Count))
