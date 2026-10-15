@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import struct
+import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -12,6 +14,7 @@ from autocad_mcp.native_pipe import (
     NativePipeClient,
     NativePipeError,
     NativeWorkerDescriptor,
+    _process_is_alive,
     discover_native_worker,
 )
 
@@ -298,3 +301,14 @@ def test_backend_detection_prefers_native_worker_without_pywin32(monkeypatch):
     )
 
     assert config.detect_backend() == "file_ipc"
+
+
+def test_process_probe_tracks_child_lifetime_without_signalling():
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    try:
+        assert _process_is_alive(child.pid) is True
+    finally:
+        child.kill()
+        child.wait()
+
+    assert _process_is_alive(child.pid) is False

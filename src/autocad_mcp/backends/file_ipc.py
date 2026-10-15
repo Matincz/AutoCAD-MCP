@@ -28,6 +28,7 @@ import structlog
 from autocad_mcp import __version__
 from autocad_mcp.audit import INSUNITS_NAMES, audit_dxf_file, build_audit, geometry_digest
 from autocad_mcp.backends.base import AutoCADBackend, BackendCapabilities, CommandResult
+from autocad_mcp.backends.tianzheng import TianzhengMixin
 from autocad_mcp.com_sta import ComStaExecutor, com_hresult, sta_async_method, sta_sync_method
 from autocad_mcp.config import (
     AutoCADStartupError,
@@ -73,6 +74,50 @@ def window_discovery_status() -> dict:
         "fatal_windows": [dict(item) for item in _LAST_WINDOW_DISCOVERY.get("fatal_windows", [])],
         "selection": _LAST_WINDOW_DISCOVERY.get("selection"),
     }
+
+
+def _ansi_codepage() -> str:
+    """The code page AutoLISP uses for open/read-line/write-line (e.g. cp936)."""
+    if sys.platform == "win32":
+        try:
+            import ctypes
+
+            return f"cp{ctypes.windll.kernel32.GetACP()}"
+        except Exception:
+            pass
+    return "cp1252"
+
+
+def _encode_ipc_request(payload: dict, codepage: str | None = None) -> bytes:
+    """Encode a request so AutoLISP's read-line sees the real characters.
+
+    Text the ANSI code page can represent (e.g. Chinese on cp936) is written
+    as-is; otherwise fall back to ASCII \\uXXXX escapes, which the dispatcher
+    decodes as well.
+    """
+    codepage = codepage or _ansi_codepage()
+    try:
+        return json.dumps(payload, ensure_ascii=False).encode(codepage)
+    except UnicodeEncodeError:
+        return json.dumps(payload).encode("ascii")
+
+
+def _decode_ipc_result(raw: bytes, codepage: str | None = None) -> str:
+    """AutoLISP writes result files in the ANSI code page, not UTF-8."""
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return raw.decode(codepage or _ansi_codepage(), errors="replace")
+
+
+def _dispatcher_load_expression(path: str) -> str:
+    """LISP that loads the dispatcher into every open and future document.
+
+    Plain ``load`` only affects the active document, so a drawing created or
+    activated later (e.g. by the native worker) had no dispatcher and every
+    LISP-path request timed out there.
+    """
+    return f'(if vl-load-all (vl-load-all "{path}") (load "{path}"))'
 
 
 def find_autocad_window(preferred_process_id: int | None = None) -> int | None:
@@ -133,12 +178,17 @@ def find_autocad_window(preferred_process_id: int | None = None) -> int | None:
 
                 if is_autocad:
                     title = str(win32gui.GetWindowText(hwnd) or "")
+                    try:
+                        owned = bool(win32gui.GetWindow(hwnd, win32con.GW_OWNER))
+                    except Exception:
+                        owned = False
                     item = {
                         "hwnd": int(hwnd),
                         "process_id": int(process_id) if process_id is not None else None,
                         "visible": True,
                         "minimized": bool(win32gui.IsIconic(hwnd)),
                         "title": title,
+                        "owned": owned,
                     }
                     if any(token in title.casefold() for token in fatal_tokens):
                         fatal_windows.append(item)
@@ -150,13 +200,13 @@ def find_autocad_window(preferred_process_id: int | None = None) -> int | None:
         _LAST_WINDOW_DISCOVERY["candidates"] = windows
         _LAST_WINDOW_DISCOVERY["fatal_windows"] = fatal_windows
         if preferred_process_id is not None:
+            matching = [
+                item for item in windows if item["process_id"] == int(preferred_process_id)
+            ]
+            # Owned windows (palettes, WPF hosts, error dialogs) share the
+            # process; the unowned frame is the application window.
             preferred = next(
-                (
-                    item
-                    for item in windows
-                    if item["process_id"] == int(preferred_process_id)
-                ),
-                None,
+                iter([item for item in matching if not item["owned"]] or matching), None
             )
             if preferred:
                 _LAST_WINDOW_DISCOVERY["selection"] = "preferred-process"
@@ -164,6 +214,11 @@ def find_autocad_window(preferred_process_id: int | None = None) -> int | None:
         if len(windows) == 1 and preferred_process_id is None:
             _LAST_WINDOW_DISCOVERY["selection"] = "single-visible-window"
             return windows[0]["hwnd"]
+        if preferred_process_id is None and len({item["process_id"] for item in windows}) == 1:
+            frames = [item for item in windows if not item["owned"]]
+            if len(frames) == 1:
+                _LAST_WINDOW_DISCOVERY["selection"] = "single-process-main-frame"
+                return frames[0]["hwnd"]
 
         executor = ComStaExecutor(name="autocad-mcp-window-discovery")
         try:
@@ -505,7 +560,7 @@ def _com_entity_to_dict(entity) -> dict:
     return {key: value for key, value in result.items() if value is not None}
 
 
-class FileIPCBackend(AutoCADBackend):
+class FileIPCBackend(TianzhengMixin, AutoCADBackend):
     """File IPC for full AutoCAD and AutoCAD LT via mcp_dispatch.lsp."""
 
     def __init__(self, *, com_executor: ComStaExecutor | None = None):
@@ -636,28 +691,35 @@ class FileIPCBackend(AutoCADBackend):
         """
         import win32com.client
 
-        application = win32com.client.GetActiveObject("AutoCAD.Application")
         expected_pid = int(self._acad_process_id or 0)
         expected_hwnd = int(self._hwnd or 0)
-        actual_hwnd = int(getattr(application, "HWND", 0) or 0)
-        if expected_pid:
-            if not actual_hwnd:
-                raise RuntimeError(
-                    "E_AUTOCAD_INSTANCE_UNVERIFIED: COM application has no HWND "
-                    f"for expected PID {expected_pid}"
-                )
-            actual_pid = _window_process_id(actual_hwnd)
-            if actual_pid != expected_pid:
-                raise RuntimeError(
-                    "E_AUTOCAD_INSTANCE_MISMATCH: COM HWND/PID does not match "
-                    f"selected AutoCAD PID {expected_pid} (actual PID {actual_pid})"
-                )
-        elif expected_hwnd and actual_hwnd and actual_hwnd != expected_hwnd:
-            raise RuntimeError(
-                "E_AUTOCAD_INSTANCE_MISMATCH: COM HWND does not match the "
-                f"selected AutoCAD HWND {expected_hwnd} (actual HWND {actual_hwnd})"
-            )
-        return application
+        # Some installations register only the versioned ProgID. GetActiveObject
+        # attaches to a running instance; never Dispatch/CreateObject here, as
+        # that could silently start a second CAD process.
+        candidates = ("AutoCAD.Application", "AutoCAD.Application.25",
+                      "AutoCAD.Application.25.0", "AutoCAD.Application.25.1",
+                      "AutoCAD.Application.24.3", "AutoCAD.Application.24.2",
+                      "AutoCAD.Application.24.1", "AutoCAD.Application.24")
+        last_error = None
+        for progid in candidates:
+            try:
+                application = win32com.client.GetActiveObject(progid)
+                actual_hwnd = int(getattr(application, "HWND", 0) or 0)
+                if expected_pid:
+                    if not actual_hwnd:
+                        raise RuntimeError("E_AUTOCAD_INSTANCE_UNVERIFIED: COM application has no HWND")
+                    actual_pid = _window_process_id(actual_hwnd)
+                    if actual_pid != expected_pid:
+                        raise RuntimeError(
+                            "E_AUTOCAD_INSTANCE_MISMATCH: COM HWND/PID does not match "
+                            f"selected AutoCAD PID {expected_pid} (actual PID {actual_pid})")
+                elif expected_hwnd and actual_hwnd != expected_hwnd:
+                    raise RuntimeError("E_AUTOCAD_INSTANCE_MISMATCH: COM HWND does not match selected AutoCAD HWND")
+                return application
+            except Exception as error:
+                last_error = error
+        raise RuntimeError(
+            f"E_AUTOCAD_COM_UNAVAILABLE: no running COM ProgID matched the selected CAD process: {last_error}") from last_error
 
     def _native_window_policy(self, *, activate: bool = False) -> dict:
         """Apply the UI policy through user32 without requiring COM/pywin32."""
@@ -800,9 +862,19 @@ class FileIPCBackend(AutoCADBackend):
             "process_id": self._acad_process_id,
         }
         visibility = self._native_window_policy()
+        # Without the LISP dispatcher every non-native operation would wait for
+        # a reply that never comes, then cancel AutoCAD's command state.
+        compat = await self._load_compat_dispatcher()
+        if not compat.ok:
+            log.warning("compat_dispatcher_unavailable", error=compat.error, code=compat.error_code)
         return CommandResult(
             ok=True,
             payload={
+                "dispatcher": compat.payload if compat.ok else {
+                    "loaded": False,
+                    "error": compat.error,
+                    "error_code": compat.error_code,
+                },
                 "autocad": {
                     **self._product_info,
                     "running": True,
@@ -828,6 +900,83 @@ class FileIPCBackend(AutoCADBackend):
                 "ready": True,
                 "visibility": visibility,
             },
+        )
+
+    async def _load_compat_dispatcher(self) -> CommandResult:
+        """Locate the command line and load/version-check mcp_dispatch.lsp.
+
+        Operations the native worker does not implement (queries, text,
+        dimensions, plotting, ...) still run through this LISP dispatcher.
+        """
+        # Find command-line child edit control for focus-free dispatch
+        self._command_hwnd = self._find_command_line_hwnd()
+        log.info("command_line_hwnd", hwnd=self._command_hwnd)
+
+        # Ensure IPC directory exists
+        self._ipc_dir.mkdir(parents=True, exist_ok=True)
+
+        # Clean up stale IPC files
+        self._cleanup_stale_files()
+
+        candidates = []
+        configured = os.environ.get("AUTOCAD_MCP_LISP_PATH", "").strip()
+        if configured:
+            candidates.append(Path(configured).expanduser())
+        bundled = LISP_DIR / "mcp_dispatch.lsp"
+        if bundled not in candidates:
+            candidates.append(bundled)
+
+        last_result = None
+        loaded_path = None
+        load_attempts = 0
+        self._dispatcher_version = None
+        for candidate in candidates:
+            if not candidate.is_file():
+                continue
+            normalized_path = str(candidate.resolve()).replace("\\", "/")
+            for attempt in range(1, 4):
+                load_attempts += 1
+                self._type_command(_dispatcher_load_expression(normalized_path))
+                await asyncio.sleep(0.75 * attempt)
+                self._wait_for_autocad_idle(timeout=10.0)
+                last_result = await self._dispatch("ping", {})
+                version = (
+                    last_result.payload.get("dispatcher_version")
+                    if last_result.ok and isinstance(last_result.payload, dict)
+                    else None
+                )
+                if version == __version__:
+                    self._dispatcher_version = version
+                    loaded_path = str(candidate.resolve())
+                    break
+            if self._dispatcher_version == __version__:
+                break
+
+        if not last_result or not last_result.ok:
+            return CommandResult(
+                ok=False,
+                error="AutoCAD is running but the MCP dispatcher could not be loaded or pinged",
+                error_code="E_DISPATCHER_NOT_LOADED",
+                payload={
+                    "load_attempts": load_attempts,
+                    "last_result": last_result.to_dict() if last_result else None,
+                },
+            )
+        if self._dispatcher_version != __version__:
+            actual = (
+                last_result.payload.get("dispatcher_version")
+                if isinstance(last_result.payload, dict)
+                else "unknown"
+            )
+            return CommandResult(
+                ok=False,
+                error=f"Dispatcher version mismatch: expected {__version__}, received {actual}",
+                error_code="E_DISPATCHER_VERSION_MISMATCH",
+            )
+
+        return CommandResult(
+            ok=True,
+            payload={"loaded": True, "path": loaded_path, "load_attempts": load_attempts},
         )
 
     async def initialize(self) -> CommandResult:
@@ -978,71 +1127,11 @@ class FileIPCBackend(AutoCADBackend):
         except Exception:
             pass
 
-        # Find command-line child edit control for focus-free dispatch
-        self._command_hwnd = self._find_command_line_hwnd()
-        log.info("command_line_hwnd", hwnd=self._command_hwnd)
-
-        # Ensure IPC directory exists
-        self._ipc_dir.mkdir(parents=True, exist_ok=True)
-
-        # Clean up stale IPC files
-        self._cleanup_stale_files()
-
-        candidates = []
-        configured = os.environ.get("AUTOCAD_MCP_LISP_PATH", "").strip()
-        if configured:
-            candidates.append(Path(configured).expanduser())
-        bundled = LISP_DIR / "mcp_dispatch.lsp"
-        if bundled not in candidates:
-            candidates.append(bundled)
-
-        last_result = None
-        loaded_path = None
-        load_attempts = 0
-        self._dispatcher_version = None
-        for candidate in candidates:
-            if not candidate.is_file():
-                continue
-            normalized_path = str(candidate.resolve()).replace("\\", "/")
-            for attempt in range(1, 4):
-                load_attempts += 1
-                self._type_command(f'(load "{normalized_path}")')
-                await asyncio.sleep(0.75 * attempt)
-                self._wait_for_autocad_idle(timeout=10.0)
-                last_result = await self._dispatch("ping", {})
-                version = (
-                    last_result.payload.get("dispatcher_version")
-                    if last_result.ok and isinstance(last_result.payload, dict)
-                    else None
-                )
-                if version == __version__:
-                    self._dispatcher_version = version
-                    loaded_path = str(candidate.resolve())
-                    break
-            if self._dispatcher_version == __version__:
-                break
-
-        if not last_result or not last_result.ok:
-            return CommandResult(
-                ok=False,
-                error="AutoCAD is running but the MCP dispatcher could not be loaded or pinged",
-                error_code="E_DISPATCHER_NOT_LOADED",
-                payload={
-                    "load_attempts": load_attempts,
-                    "last_result": last_result.to_dict() if last_result else None,
-                },
-            )
-        if self._dispatcher_version != __version__:
-            actual = (
-                last_result.payload.get("dispatcher_version")
-                if isinstance(last_result.payload, dict)
-                else "unknown"
-            )
-            return CommandResult(
-                ok=False,
-                error=f"Dispatcher version mismatch: expected {__version__}, received {actual}",
-                error_code="E_DISPATCHER_VERSION_MISMATCH",
-            )
+        dispatcher = await self._load_compat_dispatcher()
+        if not dispatcher.ok:
+            return dispatcher
+        loaded_path = dispatcher.payload["path"]
+        load_attempts = dispatcher.payload["load_attempts"]
 
         self._session.transport_state = TransportState.COM_READY
         self._session.document_state = DocumentState.READY
@@ -1802,7 +1891,7 @@ class FileIPCBackend(AutoCADBackend):
                 "params": clean_params,
                 "ts": time.time(),
             }
-            tmp_file.write_text(json.dumps(payload), encoding="utf-8")
+            tmp_file.write_bytes(_encode_ipc_request(payload))
             tmp_file.rename(cmd_file)
 
             # Type the fixed dispatch trigger only after AutoCAD reaches idle.
@@ -1824,12 +1913,7 @@ class FileIPCBackend(AutoCADBackend):
                     return self._autocad_crashed_result(crash, command)
                 if result_file.exists():
                     try:
-                        # AutoCAD LISP writes files in Windows-1252 encoding;
-                        # try UTF-8 first (covers ASCII), fall back to cp1252
-                        try:
-                            text = result_file.read_text(encoding="utf-8")
-                        except UnicodeDecodeError:
-                            text = result_file.read_text(encoding="cp1252")
+                        text = _decode_ipc_result(result_file.read_bytes())
                         data = json.loads(text)
                         # Verify request_id matches
                         if data.get("request_id") == request_id:
@@ -2470,7 +2554,9 @@ class FileIPCBackend(AutoCADBackend):
                     raise RuntimeError(f"AutoCAD created {actual_path} instead of {expected}")
 
             dispatcher = Path(os.environ.get("AUTOCAD_MCP_LISP_PATH", "") or (LISP_DIR / "mcp_dispatch.lsp"))
-            self._type_command(f'(load "{str(dispatcher.resolve()).replace(chr(92), "/")}")')
+            self._type_command(
+                _dispatcher_load_expression(str(dispatcher.resolve()).replace(chr(92), "/"))
+            )
             self._wait_for_autocad_idle(timeout=10.0)
             self._audit_revision = 0
             self._audit_fingerprints = None

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import json
 import sys
 import types
 from pathlib import Path
@@ -10,6 +11,7 @@ from unittest.mock import MagicMock
 
 import ezdxf
 import fitz
+import pytest
 from PIL import Image
 
 from autocad_mcp.backends.base import CommandResult
@@ -20,6 +22,7 @@ from autocad_mcp.logging_setup import UTF8_BOM, TeeLogWriter
 from autocad_mcp.offline import audit_dxf_offline
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows-only AutoCAD runtime behavior")
 async def test_ensure_ready_reports_broken_pywin32_before_com_or_document_access(monkeypatch):
     import autocad_mcp.backends.file_ipc as file_ipc
 
@@ -641,3 +644,73 @@ def test_output_viewer_guard_targets_only_the_generated_pdf(monkeypatch, tmp_pat
     assert [item[0] for item in calls["hidden"]] == [20]
     assert [item[0] for item in calls["closed"]] == [20]
     assert all(event["title"].startswith(target.name) for event in result["events"])
+
+
+def test_window_discovery_picks_main_frame_when_one_process_owns_several_windows(monkeypatch):
+    import autocad_mcp.backends.file_ipc as file_ipc
+
+    # One acad.exe: the MDI frame plus an owned WPF host and an owned dialog.
+    owners = {460234: 0, 4063896: 460234, 525644: 460234}
+    titles = {460234: "Autodesk AutoCAD 2025 - [plan.dwg]", 4063896: "", 525644: "AutoCAD"}
+
+    def enum_windows(callback, state):
+        for hwnd in owners:
+            callback(hwnd, state)
+
+    win32gui = types.SimpleNamespace(
+        EnumWindows=enum_windows,
+        IsWindowVisible=lambda hwnd: True,
+        IsIconic=lambda hwnd: False,
+        GetWindowText=lambda hwnd: titles[hwnd],
+        GetWindow=lambda hwnd, relation: owners[hwnd],
+    )
+    win32con = types.SimpleNamespace(
+        GW_OWNER=4, PROCESS_QUERY_INFORMATION=0x400, PROCESS_VM_READ=0x10
+    )
+    win32process = types.SimpleNamespace(
+        GetWindowThreadProcessId=lambda hwnd: (1, 6252),
+        GetModuleFileNameEx=lambda handle, module: "C:/Program Files/Autodesk/AutoCAD 2025/acad.exe",
+    )
+    win32api = types.SimpleNamespace(OpenProcess=lambda *args: object(), CloseHandle=lambda handle: None)
+    monkeypatch.setattr(file_ipc.sys, "platform", "win32")
+    monkeypatch.delenv("AUTOCAD_MCP_ACAD_PID", raising=False)
+    for name, module in {
+        "win32gui": win32gui,
+        "win32con": win32con,
+        "win32process": win32process,
+        "win32api": win32api,
+    }.items():
+        monkeypatch.setitem(sys.modules, name, module)
+
+    assert file_ipc.find_autocad_window() == 460234
+    assert file_ipc._LAST_WINDOW_DISCOVERY["selection"] == "single-process-main-frame"
+    assert file_ipc.find_autocad_window(preferred_process_id=6252) == 460234
+
+
+def test_dispatcher_loads_into_all_documents():
+    import autocad_mcp.backends.file_ipc as file_ipc
+
+    expression = file_ipc._dispatcher_load_expression("C:/x/mcp_dispatch.lsp")
+
+    assert expression == (
+        '(if vl-load-all (vl-load-all "C:/x/mcp_dispatch.lsp") (load "C:/x/mcp_dispatch.lsp"))'
+    )
+
+
+def test_ipc_result_decodes_ansi_codepage_chinese():
+    import autocad_mcp.backends.file_ipc as file_ipc
+
+    raw = '{"layers": ["P-洁具", "图层0"]}'.encode("cp936")
+
+    assert json.loads(file_ipc._decode_ipc_result(raw, "cp936")) == {"layers": ["P-洁具", "图层0"]}
+    assert file_ipc._decode_ipc_result('{"a": "客厅"}'.encode("utf-8"), "cp936") == '{"a": "客厅"}'
+
+
+def test_ipc_request_keeps_chinese_in_ansi_and_escapes_the_rest():
+    import autocad_mcp.backends.file_ipc as file_ipc
+
+    encoded = file_ipc._encode_ipc_request({"text": "客厅"}, "cp936")
+    assert encoded.decode("cp936") == '{"text": "客厅"}'
+
+    fallback = file_ipc._encode_ipc_request({"text": "客厅 😀"}, "cp936")
+    assert fallback == b'{"text": "\\u5ba2\\u5385 \\ud83d\\ude00"}'

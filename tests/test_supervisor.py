@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import codecs
 import json
+import sys
 from pathlib import Path
 from types import SimpleNamespace
+
+import pytest
 
 from autocad_mcp.supervisor import (
     DesktopSupervisor,
@@ -22,6 +25,7 @@ def test_supervisor_log_is_utf8_bom_and_preserves_chinese(tmp_path):
     assert "可见但最小化" in path.read_text(encoding="utf-8-sig")
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows-only AutoCAD runtime behavior")
 def test_supervisor_launch_owns_pid_and_exports_desktop_contract(tmp_path):
     executable = tmp_path / "acad.exe"
     executable.write_bytes(b"stub")

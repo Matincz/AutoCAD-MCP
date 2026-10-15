@@ -86,11 +86,31 @@ def native_worker_root() -> Path:
     return (Path(local) / "AutoCAD-MCP" / "workers").resolve()
 
 
+def _windows_process_is_alive(process_id: int) -> bool:
+    # os.kill(pid, 0) is not a probe on Windows: signal 0 is CTRL_C_EVENT,
+    # which broadcasts Ctrl+C to the caller's console group.
+    import ctypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    handle = kernel32.OpenProcess(0x1000, False, int(process_id))  # QUERY_LIMITED_INFORMATION
+    if not handle:
+        return ctypes.get_last_error() == 5  # ERROR_ACCESS_DENIED: exists but protected
+    try:
+        exit_code = ctypes.c_ulong()
+        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+            return True
+        return exit_code.value == 259  # STILL_ACTIVE
+    finally:
+        kernel32.CloseHandle(handle)
+
+
 def _process_is_alive(process_id: int) -> bool:
     if process_id <= 0:
         return False
     if process_id == os.getpid():
         return True
+    if sys.platform == "win32":
+        return _windows_process_is_alive(process_id)
     try:
         os.kill(process_id, 0)
         return True

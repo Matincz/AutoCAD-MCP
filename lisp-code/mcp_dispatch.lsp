@@ -90,6 +90,17 @@
 ;; Simple JSON parser (extracts string values by key)
 ;; -----------------------------------------------------------------------
 
+(defun mcp-hex4 (h / n i c)
+  "Parse four hex digits (from a JSON \\uXXXX escape) into an integer."
+  (setq n 0 i 1)
+  (while (<= i 4)
+    (setq c (ascii (strcase (substr h i 1))))
+    (setq n (+ (* n 16) (if (<= c 57) (- c 48) (- c 55))))
+    (setq i (1+ i))
+  )
+  n
+)
+
 (defun mcp-json-unescape-string (s / result i ch next)
   "Decode the JSON escapes used by the Python IPC writer."
   (setq result "" i 1)
@@ -105,6 +116,9 @@
           ((= next "n") (setq result (strcat result (chr 10))))
           ((= next "r") (setq result (strcat result (chr 13))))
           ((= next "t") (setq result (strcat result (chr 9))))
+          ((and (= next "u") (<= (+ i 5) (strlen s)))
+            (setq result (strcat result (chr (mcp-hex4 (substr s (+ i 2) 4)))))
+            (setq i (+ i 4)))
           (t (setq result (strcat result "\\" next)))
         )
         (setq i (+ i 2))
@@ -268,6 +282,9 @@
     ;; --- Drawing info ---
     ((= cmd-name "drawing-info")
      (mcp-cmd-drawing-info))
+
+    ((= cmd-name "t30-command-lookup")
+     (mcp-cmd-t30-command-lookup params-json))
 
     ((= cmd-name "drawing-setup-mechanical")
      (mcp-cmd-drawing-setup-mechanical))
@@ -523,6 +540,27 @@
 ;; Command implementations
 ;; -----------------------------------------------------------------------
 
+(defun mcp-cmd-t30-command-lookup (params / remaining split name global-result global-name symbol-found atoms output)
+  "Read command registration only; never execute the candidate commands."
+  (setq remaining (mcp-json-get-string params "names"))
+  (setq atoms (atoms-family 1) output "")
+  (while (and remaining (> (strlen remaining) 0))
+    (setq split (vl-string-search "|" remaining))
+    (if split
+      (setq name (substr remaining 1 split) remaining (substr remaining (+ split 2)))
+      (setq name remaining remaining ""))
+    (setq global-result (vl-catch-all-apply 'getcname (list name)))
+    (setq global-name (if (vl-catch-all-error-p global-result) nil global-result))
+    (setq symbol-found (if (member (strcat "C:" (strcase name)) atoms) T nil))
+    (if (> (strlen output) 0) (setq output (strcat output ",")))
+    (setq output (strcat output "{\"command\":\"" (mcp-escape-string name)
+      "\",\"global_name\":" (if global-name (strcat "\"" (mcp-escape-string global-name) "\"") "null")
+      ",\"lisp_symbol\":" (if symbol-found "true" "false")
+      ",\"registered\":" (if (or global-name symbol-found) "true" "false") "}"))
+  )
+  (cons T (strcat "{\"commands\":[" output "],\"executed\":false}"))
+)
+
 (defun mcp-cmd-drawing-info ( / count layers layer-list)
   "Return drawing info: entity count, layers, extents."
   (setq count 0)
@@ -734,7 +772,8 @@
   )
   (if ent
     (progn
-      (command "_.MOVE" ent "" '(0 0 0) (list dx dy 0))
+      ;; Scripted coordinates must not snap to nearby drawing geometry.
+      (command "_.MOVE" ent "" "_non" '(0 0 0) "_non" (list dx dy 0))
       (cons T "\"moved\""))
     (cons nil "Entity not found")
   )

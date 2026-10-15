@@ -4,10 +4,16 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <PlatformTarget>x64</PlatformTarget>
+    <UseWPF>true</UseWPF>
     <RootNamespace>AutoCADMcp.Plugin</RootNamespace>
     <AssemblyName>AutoCADMcp.Plugin</AssemblyName>
     <AutoCADDir Condition="'$(AutoCADDir)' == ''">$(AUTOCAD_MCP_AUTOCAD_DIR)</AutoCADDir>
   </PropertyGroup>
+
+  <ItemGroup>
+    <!-- UseWPF drops System.IO from the implicit usings. -->
+    <Using Include="System.IO" />
+  </ItemGroup>
 
   <ItemGroup>
     <Reference Include="AcCoreMgd">

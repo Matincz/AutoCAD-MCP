@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using System.Windows.Threading;
 using Autodesk.AutoCAD.ApplicationServices;
 using Autodesk.AutoCAD.DatabaseServices;
 using Autodesk.AutoCAD.Geometry;
@@ -15,10 +16,13 @@ internal sealed class CadDispatcher
     private readonly DocumentRegistry registry;
     private readonly string? requiredToken;
     private readonly ConcurrentDictionary<string, (string Hash, RpcResponse Response)> completed = new();
+    private readonly Dispatcher autocadThread;
 
+    // Must be constructed on AutoCAD's main thread (IExtensionApplication.Initialize).
     internal CadDispatcher(DocumentRegistry registry)
     {
         this.registry = registry;
+        autocadThread = Dispatcher.CurrentDispatcher;
         requiredToken = Environment.GetEnvironmentVariable("AUTOCAD_MCP_PLUGIN_TOKEN");
     }
 
@@ -50,45 +54,7 @@ internal sealed class CadDispatcher
         }
 
         var completion = new TaskCompletionSource<RpcResponse>(TaskCreationOptions.RunContinuationsAsynchronously);
-        try
-        {
-            AcApplication.DocumentManager.ExecuteInApplicationContext(_ =>
-            {
-                RpcResponse response;
-                try
-                {
-                    response = DispatchOnAutoCADThread(request);
-                }
-                catch (CadProtocolException error)
-                {
-                    response = RpcResponse.Failure(
-                        request.Id,
-                        error.Code,
-                        error.Message,
-                        error.Recoverable,
-                        error.RecommendedAction,
-                        error.Details);
-                }
-                catch (Exception error)
-                {
-                    response = RpcResponse.Failure(
-                        request.Id,
-                        "E_NATIVE_PLUGIN_FAILURE",
-                        error.Message,
-                        details: new { exceptionType = error.GetType().FullName });
-                }
-
-                // A failed mutation was never committed, so it must remain retryable.
-                // Only successful responses are safe to replay indefinitely.
-                if (request.IdempotencyKey is not null && response.Ok)
-                {
-                    completed.TryAdd(request.IdempotencyKey, (requestHash, response));
-                }
-                completion.TrySetResult(response);
-            }, null);
-        }
-        catch (Exception error)
-        {
+        void RejectScheduling(Exception error) =>
             // ExecuteInApplicationContext can reject work synchronously while
             // AutoCAD is closing or inside a modal command.  Complete the RPC
             // immediately; otherwise the pipe client only sees a timeout and
@@ -100,6 +66,63 @@ internal sealed class CadDispatcher
                 recoverable: true,
                 recommendedAction: "wait_for_autocad_to_return_to_idle_then_retry",
                 details: new { exceptionType = error.GetType().FullName, error = error.Message }));
+
+        // The pipe listener runs on a thread-pool thread.  DocumentManager APIs,
+        // including ExecuteInApplicationContext, must be entered from AutoCAD's
+        // main thread; calling them here raised Application.Idle off-thread and
+        // crashed the WPF ribbon with "calling thread cannot access this object".
+        void Schedule()
+        {
+            try
+            {
+                AcApplication.DocumentManager.ExecuteInApplicationContext(_ =>
+                {
+                    RpcResponse response;
+                    try
+                    {
+                        response = DispatchOnAutoCADThread(request);
+                    }
+                    catch (CadProtocolException error)
+                    {
+                        response = RpcResponse.Failure(
+                            request.Id,
+                            error.Code,
+                            error.Message,
+                            error.Recoverable,
+                            error.RecommendedAction,
+                            error.Details);
+                    }
+                    catch (Exception error)
+                    {
+                        response = RpcResponse.Failure(
+                            request.Id,
+                            "E_NATIVE_PLUGIN_FAILURE",
+                            error.Message,
+                            details: new { exceptionType = error.GetType().FullName });
+                    }
+
+                    // A failed mutation was never committed, so it must remain retryable.
+                    // Only successful responses are safe to replay indefinitely.
+                    if (request.IdempotencyKey is not null && response.Ok)
+                    {
+                        completed.TryAdd(request.IdempotencyKey, (requestHash, response));
+                    }
+                    completion.TrySetResult(response);
+                }, null);
+            }
+            catch (Exception error)
+            {
+                RejectScheduling(error);
+            }
+        }
+
+        try
+        {
+            autocadThread.BeginInvoke(new Action(Schedule));
+        }
+        catch (Exception error)
+        {
+            RejectScheduling(error);
         }
         return completion.Task;
     }
@@ -175,14 +198,24 @@ internal sealed class CadDispatcher
             {
                 fullPath = Path.GetFullPath(requestedPath);
                 Directory.CreateDirectory(Path.GetDirectoryName(fullPath)!);
-                using DocumentLock documentLock = document.LockDocument();
-                document.Database.SaveAs(fullPath, DwgVersion.Current);
+                using (document.LockDocument())
+                {
+                    document.Database.SaveAs(fullPath, DwgVersion.Current);
+                }
+                // Do not close and reopen the file to fix the document name:
+                // opening a file from the plugin crashed AutoCAD 2025 in
+                // SharedRecentFilesHandlers (WSUtils.IsLoggedIn access violation).
+                if (File.Exists(fullPath))
+                {
+                    registry.RecordSavedPath(document, fullPath);
+                }
             }
             Dictionary<string, object?> context = registry.Context(document);
             context["requestedPath"] = requestedPath;
+            string? actualPath = context["activePath"] as string;
             object[] diff = string.IsNullOrWhiteSpace(fullPath)
                 ? Array.Empty<object>()
-                : fullPath.Equals(document.Database.Filename, StringComparison.OrdinalIgnoreCase)
+                : fullPath.Equals(actualPath, StringComparison.OrdinalIgnoreCase)
                     ? Array.Empty<object>()
                     : new object[]
                     {
@@ -190,7 +223,7 @@ internal sealed class CadDispatcher
                         {
                             path = "activePath",
                             requested = fullPath,
-                            actual = document.Database.Filename,
+                            actual = actualPath,
                         },
                     };
             context["diff"] = diff;
@@ -435,11 +468,9 @@ internal sealed class CadDispatcher
         double width = Positive(data, "width");
         double height = Positive(data, "height");
         var solid = new Solid3d();
+        // Solid3d.CreateBox is centered on the origin.
         solid.CreateBox(length, width, height);
-        solid.TransformBy(Matrix3d.Displacement(new Vector3d(
-            center.X - length / 2.0,
-            center.Y - width / 2.0,
-            center.Z - height / 2.0)));
+        solid.TransformBy(Matrix3d.Displacement(center.GetAsVector()));
         return solid;
     }
 
@@ -494,7 +525,8 @@ internal sealed class CadDispatcher
         }
         var solid = new Solid3d();
         solid.CreateFrustum(Math.Abs(height), radius, radius, radius);
-        double z = height > 0 ? baseCenter.Z : baseCenter.Z + height;
+        // Solid3d.CreateFrustum is centered on the origin, not standing on its base.
+        double z = (height > 0 ? baseCenter.Z : baseCenter.Z + height) + Math.Abs(height) / 2.0;
         solid.TransformBy(Matrix3d.Displacement(new Vector3d(baseCenter.X, baseCenter.Y, z)));
         return solid;
     }
@@ -526,11 +558,13 @@ internal sealed class CadDispatcher
 
         static double[] Point(JsonElement value)
         {
-            if (value.ValueKind != JsonValueKind.Array || value.GetArrayLength() < 3)
+            // Creation accepts [x, y] with z = 0; readback must compare the same way.
+            if (value.ValueKind != JsonValueKind.Array || value.GetArrayLength() is < 2 or > 3)
             {
                 throw new CadProtocolException("E_POSTCONDITION_MISMATCH", "A point readback request is malformed");
             }
-            return value.EnumerateArray().Take(3).Select(item => item.GetDouble()).ToArray();
+            double[] coordinates = value.EnumerateArray().Select(item => item.GetDouble()).ToArray();
+            return coordinates.Length == 3 ? coordinates : new[] { coordinates[0], coordinates[1], 0.0 };
         }
 
         void Compare(string path, double expected, double actual)
