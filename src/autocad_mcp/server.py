@@ -927,6 +927,7 @@ async def entity(
       fillet  — data: {id1, id2, radius}
       chamfer — data: {id1, id2, dist1, dist2}
       erase   — entity_id
+      set_constant_width — entity_id (LWPOLYLINE), data: {width}
     """
     data = data or {}
     backend = await get_backend()
@@ -935,7 +936,7 @@ async def entity(
         "create_arc", "create_tangent_arc", "create_ellipse", "create_mtext",
         "create_text", "create_hatch", "create_batch", "list", "count", "get",
         "get_many", "copy", "move", "rotate", "scale", "mirror", "offset", "array", "fillet",
-        "chamfer", "trim", "extend", "break", "join", "constrain", "erase",
+        "chamfer", "trim", "extend", "break", "join", "constrain", "erase", "set_constant_width",
     }
     if operation not in known_operations:
         return tool_error(f"Unknown entity operation: {operation}", code="E_UNSUPPORTED_OPERATION")
@@ -1150,6 +1151,20 @@ async def entity(
             payload = result.payload if isinstance(result.payload, dict) else {}
             payload["registry_sync"] = registry
             result.payload = payload
+    elif operation == "set_constant_width":
+        width = data.get("width")
+        if (
+            not entity_id
+            or isinstance(width, bool)
+            or not isinstance(width, (int, float))
+            or not math.isfinite(width)
+            or width < 0
+        ):
+            return tool_error(
+                "set_constant_width needs entity_id and data.width >= 0",
+                code="E_PARAMETER_REJECTED",
+            )
+        result = await backend.entity_set_constant_width(entity_id, float(width))
     if hatch_contract is not None:
         result = await backend.verify_created_hatch(result, **hatch_contract)
     if expectation is not None:

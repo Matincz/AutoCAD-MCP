@@ -530,6 +530,10 @@ def _com_entity_to_dict(entity) -> dict:
                 ]
             except Exception:
                 pass
+            try:
+                result["constant_width"] = round(float(entity.ConstantWidth), 4)
+            except Exception:
+                pass
     elif entity_type in ("TEXT", "MTEXT"):
         result.update(
             insert=_com_point(
@@ -4298,6 +4302,14 @@ class FileIPCBackend(TianzhengMixin, AutoCADBackend):
 
     async def entity_copy(self, entity_id, dx, dy) -> CommandResult:
         return await self._dispatch("entity-copy", {"entity_id": entity_id, "dx": dx, "dy": dy})
+
+    async def entity_set_constant_width(self, entity_id: str, width: float) -> CommandResult:
+        try:
+            return await self._dispatch("entity-set-constant-width", {"entity_id": str(entity_id), "width": float(width)})
+        except Exception as exc:
+            return self._exception_result(
+                exc, operation="entity.set_constant_width", parameters={"entity_id": entity_id, "width": width}
+            )
 
     async def entity_move(self, entity_id, dx, dy) -> CommandResult:
         return await self._dispatch("entity-move", {"entity_id": entity_id, "dx": dx, "dy": dy})

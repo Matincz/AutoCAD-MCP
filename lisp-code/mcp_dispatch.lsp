@@ -355,6 +355,9 @@
     ((= cmd-name "entity-erase")
      (mcp-cmd-entity-erase params-json))
 
+    ((= cmd-name "entity-set-constant-width")
+     (mcp-cmd-entity-set-constant-width params-json))
+
     ;; --- Entity modification ---
     ((= cmd-name "entity-move")
      (mcp-cmd-entity-move params-json))
@@ -581,15 +584,17 @@
   (cons T (strcat "{\"entity_count\":" (itoa count) ",\"layers\":[" layer-list "]}"))
 )
 
-(defun mcp-cmd-layer-list ( / layers layer-list name)
+(defun mcp-cmd-layer-list ( / layers layer-list name ent lw)
   "Return all layers as JSON array."
   (setq layer-list "")
   (setq layers (tblnext "LAYER" T))
   (while layers
     (setq name (cdr (assoc 2 layers)))
+    (setq ent (entget (tblobjname "LAYER" name)))
+    (setq lw (if (assoc 370 ent) (cdr (assoc 370 ent)) -3))
     (if (> (strlen layer-list) 0)
-      (setq layer-list (strcat layer-list ",{\"name\":\"" name "\",\"color\":" (itoa (cdr (assoc 62 layers))) "}"))
-      (setq layer-list (strcat "{\"name\":\"" name "\",\"color\":" (itoa (cdr (assoc 62 layers))) "}"))
+      (setq layer-list (strcat layer-list ",{\"name\":\"" (mcp-escape-string name) "\",\"color\":" (itoa (cdr (assoc 62 layers))) ",\"lineweight\":" (itoa lw) "}"))
+      (setq layer-list (strcat "{\"name\":\"" (mcp-escape-string name) "\",\"color\":" (itoa (cdr (assoc 62 layers))) ",\"lineweight\":" (itoa lw) "}"))
     )
     (setq layers (tblnext "LAYER"))
   )
@@ -776,6 +781,41 @@
       (command "_.MOVE" ent "" "_non" '(0 0 0) "_non" (list dx dy 0))
       (cons T "\"moved\""))
     (cons nil "Entity not found")
+  )
+)
+
+(defun mcp-cmd-entity-set-constant-width (params / entity-id width ent data out after)
+  "Give an LWPOLYLINE one global width by setting every vertex's 40/41 and group 43."
+  (setq entity-id (mcp-json-get-string params "entity_id"))
+  (setq width (mcp-json-get-number params "width"))
+  (setq ent (if entity-id (handent entity-id)))
+  (cond
+    ((not ent) (cons nil (strcat "Entity not found: " (if entity-id entity-id ""))))
+    ((or (not width) (< width 0.0)) (cons nil "width must be a number >= 0"))
+    ((/= (cdr (assoc 0 (setq data (entget ent)))) "LWPOLYLINE")
+      (cons nil (strcat "Constant width needs an LWPOLYLINE, got " (cdr (assoc 0 data)))))
+    (t
+      (setq width (float width))
+      ;; 43 must precede the vertex groups, so rebuild instead of appending.
+      (foreach item (mcp-remove-dxf data 43)
+        (cond
+          ((member (car item) '(40 41)) (setq out (cons (cons (car item) width) out)))
+          ((= (car item) 70) (setq out (cons (cons 43 width) (cons item out))))
+          (t (setq out (cons item out)))
+        )
+      )
+      (cond
+        ((not (entmod (reverse out))) (cons nil (strcat "AutoCAD rejected the width change: " entity-id)))
+        ((progn
+           (setq after nil)
+           (foreach item (entget ent)
+             (if (and (member (car item) '(40 41)) (not (equal (cdr item) width 1e-9))) (setq after T)))
+           after)
+          (cons nil (strcat "Polyline width did not change: " entity-id)))
+        (t (entupd ent)
+           (cons T (strcat "{\"handle\":\"" (mcp-escape-string entity-id) "\",\"constant_width\":" (rtos width 2 4) "}")))
+      )
+    )
   )
 )
 

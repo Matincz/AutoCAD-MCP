@@ -28,6 +28,7 @@ VARIABLE_RULES = {
     "MSLTSCALE": VariableRule(int, 0, 1, frozenset({0, 1})),
     "MEASUREMENT": VariableRule(int, 0, 1, frozenset({0, 1})),
     "MIRRTEXT": VariableRule(int, 0, 1, frozenset({0, 1})),
+    "LWDISPLAY": VariableRule(int, 0, 1, frozenset({0, 1})),
 }
 
 
